@@ -186,21 +186,22 @@ def viewer_data(ds: pv.Dataset, rows: int, cols: int) -> dict:
 
 
 @st.fragment
-def viewer(ds: pv.Dataset, rows: int, cols: int) -> None:
+def viewer(ds: pv.Dataset, rows: int, cols: int, preview_on: bool) -> None:
     # The grid steps frames in the browser. Once navigation pauses it reports the
     # frame (st.session_state.viewer["frame"]) and, after a rearrangement, the
     # tile order as view names (st.session_state.viewer["layout"]) for later
     # phases; being a fragment, those reports rerun only this part of the page.
     grid = grid_component(read("common.js", "viewer.js"), read("viewer.css"))
-    result = grid(key="viewer", data=viewer_data(ds, rows, cols), default={"frame": ds.timeline[0], "layout": None},
+    result = grid(key="viewer", data={**viewer_data(ds, rows, cols), "previewOn": preview_on},
+                  default={"frame": ds.timeline[0], "layout": None},
                   on_frame_change=lambda: None, on_layout_change=lambda: None, on_preview_change=lambda: None)
-    request = getattr(result, "preview", None)   # Preview button: frame + visible tile arrangement
+    request = getattr(result, "preview", None)   # Preview toggle switched on: frame + visible tile arrangement
     if request:
         ss = st.session_state
         ss.preview_nonce = ss.get("preview_nonce", 0) + 1
         ss.preview = {"root": ds.root, "frame": int(request["frame"]), "tiles": list(request["tiles"]),
                       "cols": int(request["cols"]), "nonce": ss.preview_nonce}
-        st.rerun()   # the preview pane lives outside this fragment
+        st.rerun()   # the pane switches to the preview, which lives outside this fragment
 
 
 def preview_data(ds: pv.Dataset, request: dict) -> dict:
@@ -227,14 +228,31 @@ def preview_data(ds: pv.Dataset, request: dict) -> dict:
     }
 
 
+def remembered(key: str, default):
+    """Give a widget back the value it had when it was last drawn.
+
+    Streamlit forgets a widget's value when a run does not draw it (here: while the preview
+    is off), so the last value is also kept under a second key.
+    """
+    ss = st.session_state
+    if key not in ss:
+        ss[key] = ss.get(f"_kept::{key}", default)
+    return key
+
+
+def keep(key: str) -> None:
+    st.session_state[f"_kept::{key}"] = st.session_state.get(key)
+
+
 def ground_truth_controls(ds: pv.Dataset) -> dict:
-    """Top of the preview pane: overlay checkbox and object picker. Returns the overlay settings."""
+    """Top of the preview: overlay checkbox and object picker. Returns the overlay settings."""
     row = st.container(horizontal=True, vertical_alignment="center")
-    on = row.checkbox("Ground truth values", key="gt_on",
+    on = row.checkbox("Ground truth values", key=remembered("gt_on", False),
                       help="Draw a point cloud on the ground-truth 3D box of each selected object, "
                            "with each point's trajectory over the last second, in every view.")
+    keep("gt_on")
     truth = None
-    key = f"gt_objects::{ds.root}"
+    key = remembered(f"gt_objects::{ds.root}", [])
     if on or gtm.is_loaded(ds) or st.session_state.get(key):   # read the boxes once first wanted
         with st.spinner("Reading ground truth..."):
             truth = gtm.get(ds)
@@ -245,6 +263,7 @@ def ground_truth_controls(ds: pv.Dataset) -> dict:
         disabled=not (on and objects),
         placeholder=("Choose objects to track" if objects or not on
                      else "No labelled objects (bounding_box_3d) in this recording"))
+    keep(key)
     if on and objects and not chosen:
         st.caption("Choose one or more objects to show their tracked points.")
     return {
@@ -257,17 +276,16 @@ def ground_truth_controls(ds: pv.Dataset) -> dict:
 
 
 @st.fragment
-def preview_pane(ds: pv.Dataset, request: dict) -> None:
-    # The player reports its FPS (st.session_state.player["fps"]) for later phases.
-    head = st.container(horizontal=True, vertical_alignment="center", horizontal_alignment="distribute")
-    head.markdown("##### Preview")
-    if head.button("Close", icon=":material/close:", key="close_preview", type="tertiary"):
-        st.session_state.preview = None
-        st.rerun()
+def preview_body(ds: pv.Dataset, request: dict) -> None:
+    """The pane's content while the Preview toggle is on (the viewer is hidden, not removed)."""
     overlay = ground_truth_controls(ds)
     player = player_component(read("common.js", "preview.js"), read("viewer.css", "preview.css"))
-    player(key="player", data={**preview_data(ds, request), "gt": overlay}, default={"fps": SOURCE_FPS},
-           on_fps_change=lambda: None)
+    result = player(key="player", data={**preview_data(ds, request), "gt": overlay}, default={"fps": SOURCE_FPS},
+                    on_fps_change=lambda: None, on_close_change=lambda: None)
+    # The player reports its FPS (st.session_state.player["fps"]) for later phases.
+    if getattr(result, "close", None):   # Preview toggle switched off: back to the viewer
+        st.session_state.preview = None
+        st.rerun()
     with st.container(horizontal=True, horizontal_alignment="center"):
         st.button("Convert", icon=":material/output:", key="convert",
                   help="Convert the recording to the MV-Kubric format (not active yet).")
@@ -298,15 +316,16 @@ def controls_help() -> None:
         "- **Resize the viewer:** drag its right edge for the width, its bottom edge for the height, "
         "or the corner for both; the grid scales to fit. Double-click a handle to reset. "
         "This panel moves beside or below the viewer to fit.\n"
-        "- **Preview:** click Preview under the frame controls. A pane opens that plays the arranged "
-        "views as one video, starting at the current frame. Click its play button to play or pause; "
-        "double-click it to stop and go back to the start frame. FPS sets how many frames are shown per "
-        f"second: playback stays real time and uses evenly spaced frames of the {SOURCE_FPS} recorded "
-        "each second (15 shows every 2nd frame). The pane resizes like the viewer.\n"
-        "- **Ground truth:** in the preview pane, tick Ground truth values and choose objects. Each "
+        "- **Preview:** switch on the Preview toggle under the frame controls. The pane turns into a "
+        "player for the arranged views as one video, starting at the current frame; switch the toggle "
+        "off to get the viewer back as it was. Click the play button to play or pause; double-click "
+        "it to stop and go back to the start frame. FPS sets how many frames are shown per second: "
+        f"playback stays real time and uses evenly spaced frames of the {SOURCE_FPS} recorded each "
+        "second (15 shows every 2nd frame).\n"
+        "- **Ground truth:** in the preview, tick Ground truth values and choose objects. Each "
         "object gets 26 tracked points on its ground-truth 3D box, drawn in every view with the path "
         "of the last second.")
-    st.caption("MV-Kubric conversion will be added here in a later phase.")
+    st.caption("The Convert button in the preview will run the MV-Kubric conversion in a later phase.")
 
 
 # --------------------------------------------------------------------------- page
@@ -318,9 +337,9 @@ CSS = """
 /* Keep the grid fully visible during reruns (no fade-out). */
 [data-testid="stElementContainer"][data-stale="true"] { opacity: 1 !important; transition: none !important; }
 
-/* Viewer, preview and side panel flow in one wrapping row. The viewer's and the preview's sizes are
-   set by dragging their edges (resizer.js keeps them in --mvk-panel-* / --mvk-preview-*); until
-   resized, the preview fills the room beside the viewer. Panels that do not fit wrap below. */
+/* The viewer pane (which also shows the preview) and the side panel flow in one wrapping row. The
+   pane's size is set by dragging its edges (resizer.js keeps it in --mvk-panel-w / -h); the side
+   panel sits beside it when it fits, else below. */
 .st-key-mvk_layout { align-items: flex-start; }
 .st-key-mvk_layout > [data-testid="stLayoutWrapper"]:has(> .st-key-mvk_panel) {
   flex: 0 0 auto; width: var(--mvk-panel-w, 70%); min-width: min(380px, 100%); max-width: 100%;
@@ -328,12 +347,7 @@ CSS = """
 }
 .st-key-mvk_panel { min-height: 0; overflow: auto; }
 .st-key-mvk_layout > [data-testid="stLayoutWrapper"]:has(> .st-key-mvk_side) { flex: 1 1 300px; min-width: 280px; }
-.st-key-mvk_layout > [data-testid="stLayoutWrapper"]:has(> .st-key-mvk_preview) {
-  flex-grow: var(--mvk-preview-grow, 1); flex-shrink: 0; flex-basis: var(--mvk-preview-w, 380px);
-  min-width: min(380px, 100%); max-width: 100%; height: var(--mvk-preview-h, auto); position: relative;
-}
-.st-key-mvk_preview { min-height: 0; overflow: auto; }
-.st-key-panel_resizer, .st-key-preview_resizer { display: none; }
+.st-key-panel_resizer { display: none; }
 .st-key-mvk_controls .st-key-folder { flex: 1 1 320px !important; min-width: 220px; }
 .mvk-resize { position: absolute; z-index: 10; display: flex; align-items: center; justify-content: center; touch-action: none; }
 .mvk-resize-x { top: 0; bottom: 0; right: -14px; width: 12px; cursor: col-resize; }
@@ -355,72 +369,74 @@ body.mvk-resize-xy-active * { cursor: nwse-resize !important; }
 </style>
 """
 
+# While the Preview toggle is on, the viewer's own elements are hidden. They stay in the page so
+# that the folder, grid size, frame and arrangement are all still there when it is switched off.
+HIDE_VIEWER = "<style>.st-key-mvk_viewer_body { display: none !important; }</style>"
+
 
 def main() -> None:
     st.set_page_config(page_title="MV dataset viewer", page_icon=":material/view_module:", layout="wide")
-    st.html(CSS)  # style-only HTML goes to the event container and takes no space
     ss = st.session_state
     if "folder" not in ss:
         ss.folder = DEFAULT_FOLDER if os.path.isdir(DEFAULT_FOLDER) else ""
+
+    ds, problem = find_dataset(clean_path(ss.folder))
+    request = ss.get("preview")
+    if request and (ds is None or request["root"] != ds.root):
+        ss.preview = request = None        # another folder was opened: back to the viewer
+    preview_on = request is not None
+    st.html(CSS + (HIDE_VIEWER if preview_on else ""))  # style-only HTML takes no space on the page
 
     if os.environ.get(pv.ROUTES_ENV) != "1":
         st.error("The image routes are not running. Start the app with `~/mvkubric_app/run.sh` "
                  "(it runs `streamlit run serve.py`), not `streamlit run app.py`.")
         return
 
-    ds, problem = find_dataset(clean_path(ss.folder))
-    request = ss.get("preview")
-    if request and (ds is None or request["root"] != ds.root):
-        ss.preview = request = None        # another folder was opened: close the preview
-
-    # Resizable viewer unit (folder, grid size, grid), the preview pane when open, and a side
-    # panel; they sit side by side when they fit and wrap below otherwise.
-    resizer = resizer_component(read("resizer.js"))
+    # One resizable pane (viewer, or preview while the toggle is on) and a side panel that sits
+    # beside it when it fits and wraps below otherwise.
     with st.container(horizontal=True, key="mvk_layout"):
         panel = st.container(border=True, key="mvk_panel")
-        preview_box = st.container(border=True, key="mvk_preview") if request else None
         side = st.container(key="mvk_side")
 
     with panel:
-        resizer(key="panel_resizer", data={"panel": "mvk_panel", "name": "panel"})
-        st.markdown("##### Multi-view dataset viewer")
-        controls = st.container(horizontal=True, vertical_alignment="bottom", key="mvk_controls")
-        controls.text_input("Dataset folder", key="folder", placeholder=DEFAULT_FOLDER,
-                            help="Full path of a recording folder whose subfolders (view01, view02, ... "
-                                 "or Replicator_XX) each contain an rgb/ folder with rgb_<frame>.png files.")
-        if controls.button("Browse...", icon=":material/folder_open:"):
-            ss.browse_dir = str(existing_dir(ss.folder))
-            browse_dialog()
-        grid_size = controls.container(horizontal=True, vertical_alignment="bottom", width="content")
+        resizer_component(read("resizer.js"))(key="panel_resizer", data={"panel": "mvk_panel", "name": "panel"})
+        st.markdown("##### Preview" if preview_on else "##### Multi-view dataset viewer")
+        with st.container(key="mvk_viewer_body"):
+            controls = st.container(horizontal=True, vertical_alignment="bottom", key="mvk_controls")
+            controls.text_input("Dataset folder", key="folder", placeholder=DEFAULT_FOLDER,
+                                help="Full path of a recording folder whose subfolders (view01, view02, ... "
+                                     "or Replicator_XX) each contain an rgb/ folder with rgb_<frame>.png files.")
+            if controls.button("Browse...", icon=":material/folder_open:"):
+                ss.browse_dir = str(existing_dir(ss.folder))
+                browse_dialog()
+            grid_size = controls.container(horizontal=True, vertical_alignment="bottom", width="content")
 
-        if ds is None:
-            getattr(st, problem[0])(problem[1])
-            # The grid-size widgets were not drawn, so Streamlit forgets their values;
-            # make the next valid folder start again from the default grid.
-            ss.pop("loaded_root", None)
-            with side:
-                controls_help()
-            return
-        pv.register(ds)
+            if ds is None:
+                getattr(st, problem[0])(problem[1])
+                # The grid-size widgets were not drawn, so Streamlit forgets their values;
+                # make the next valid folder start again from the default grid.
+                ss.pop("loaded_root", None)
+                with side:
+                    controls_help()
+                return
+            pv.register(ds)
 
-        # A new dataset folder resets the grid shape to fit its number of views.
-        if ss.get("loaded_root") != ds.root:
-            ss.loaded_root = ds.root
-            ss.rows, ss.cols = auto_grid(len(ds.views))
+            # A new dataset folder resets the grid shape to fit its number of views.
+            if ss.get("loaded_root") != ds.root:
+                ss.loaded_root = ds.root
+                ss.rows, ss.cols = auto_grid(len(ds.views))
 
-        rows = int(grid_size.number_input("Rows (m)", key="rows", min_value=1, max_value=MAX_GRID, step=1,
-                                         width=130))
-        cols = int(grid_size.number_input("Columns (n)", key="cols", min_value=1, max_value=MAX_GRID, step=1,
-                                         width=130))
-        if rows * cols < len(ds.views):
-            st.caption(f":orange[The grid has {rows * cols} tiles for {len(ds.views)} views. "
-                       "Enlarge it to bring the hidden views in and arrange them.]")
-        viewer(ds, rows, cols)
+            rows = int(grid_size.number_input("Rows (m)", key="rows", min_value=1, max_value=MAX_GRID, step=1,
+                                             width=130))
+            cols = int(grid_size.number_input("Columns (n)", key="cols", min_value=1, max_value=MAX_GRID, step=1,
+                                             width=130))
+            if rows * cols < len(ds.views):
+                st.caption(f":orange[The grid has {rows * cols} tiles for {len(ds.views)} views. "
+                           "Enlarge it to bring the hidden views in and arrange them.]")
+            viewer(ds, rows, cols, preview_on)
 
-    if preview_box is not None:
-        with preview_box:
-            resizer(key="preview_resizer", data={"panel": "mvk_preview", "name": "preview"})
-            preview_pane(ds, request)
+        if preview_on:
+            preview_body(ds, request)
 
     with side:
         dataset_info(ds)

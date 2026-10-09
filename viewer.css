@@ -113,6 +113,41 @@
 .mvk-cell:not(.mvk-empty) .mvk-frame { cursor: grab; }
 .mvk-dragging, .mvk-dragging .mvk-frame { cursor: grabbing !important; }
 
-/* Preview button under the navigation row. */
-.mvk-actions { display: flex; justify-content: center; margin-top: 0.5rem; }
-.mvk-btn-wide { gap: 0.4rem; padding: 0 1rem; font: inherit; font-size: 0.95rem; }
+/* Preview toggle under the navigation row (looks like Streamlit's st.toggle). */
+.mvk-actions { display: flex; justify-content: center; margin-top: 0.6rem; }
+.mvk-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.2rem 0.4rem;
+  border: none;
+  background: none;
+  color: var(--st-text-color, #31333f);
+  font: inherit;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+.mvk-switch {
+  position: relative;
+  width: 2.25rem;
+  height: 1.25rem;
+  flex: none;
+  border-radius: 0.625rem;
+  background: var(--st-border-color, rgba(49, 51, 63, 0.3));
+  transition: background 0.15s;
+}
+.mvk-switch::after {
+  content: "";
+  position: absolute;
+  top: 0.125rem;
+  left: 0.125rem;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  transition: transform 0.15s;
+}
+.mvk-toggle[aria-checked="true"] .mvk-switch { background: var(--st-primary-color, #ff4b4b); }
+.mvk-toggle[aria-checked="true"] .mvk-switch::after { transform: translateX(1rem); }
+.mvk-toggle:focus-visible { outline: 2px solid var(--st-primary-color, #ff4b4b); border-radius: 0.4rem; }

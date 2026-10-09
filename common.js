@@ -129,3 +129,15 @@ function roomForContent(panel, heightVar, root, content) {
   for (const child of panel.children) end = Math.max(end, child.getBoundingClientRect().bottom);
   return bottom - box.top - (end - box.bottom) - 4;
 }
+
+// A switch that looks like Streamlit's st.toggle (styles in viewer.css).
+function makeToggle(parent, label, checked) {
+  const button = el("button", "mvk-toggle", parent);
+  button.type = "button";
+  button.setAttribute("role", "switch");
+  el("span", "mvk-switch", button);
+  el("span", "mvk-toggle-label", button).textContent = label;
+  button.setChecked = (on) => button.setAttribute("aria-checked", on ? "true" : "false");
+  button.setChecked(checked);
+  return button;
+}

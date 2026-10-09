@@ -9,7 +9,7 @@
 //   < > buttons, Left/Right keys    step one frame; hold to keep stepping (Shift: 10)
 //   frame box + Enter               jump to the nearest existing frame
 //   left-button drag on a view      drop it on another tile to swap the two
-//   Preview button                  opens the preview pane at this frame with this arrangement
+//   Preview toggle                  turns this pane into the preview (frame + arrangement go along)
 
 const AHEAD = 12;             // frames preloaded by the browser in the direction of travel
 const BEHIND = 4;             // ...and behind
@@ -115,10 +115,8 @@ function buildViewer(root, data) {
   next.setAttribute("aria-label", "Next frame");
   const status = el("span", "mvk-status", nav);
   const actions = el("div", "mvk-actions", root);
-  const previewBtn = el("button", "mvk-btn mvk-btn-wide", actions);
-  previewBtn.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M8 5v14l11-7z" ` +
-    `fill="currentColor"/></svg><span>Preview</span>`;
-  previewBtn.title = "Open the preview pane, starting at this frame with this arrangement";
+  const previewToggle = makeToggle(actions, "Preview", false);
+  previewToggle.title = "Turn this pane into the preview: the arranged views play as one video from this frame";
 
   const v = {
     idx: nearestIndex(timeline, savedFrame.get(data.root) ?? restoreFrame(data.root)),
@@ -289,8 +287,10 @@ function buildViewer(root, data) {
     button.addEventListener("click", (e) => { if (e.detail === 0) v.step(dir); });  // Enter/Space when focused
   }
 
-  previewBtn.addEventListener("click", () => {
+  v.setPreviewOn = (on) => previewToggle.setChecked(on);
+  previewToggle.addEventListener("click", () => {
     if (!v.setTriggerValue) return;
+    previewToggle.setChecked(true);        // immediate feedback; app.py then switches the pane
     v.setTriggerValue("preview", {
       frame: timeline[v.idx],
       tiles: slots.slice(0, data.cells).map((view) => (view >= 0 ? data.views[view] : null)),
@@ -430,13 +430,15 @@ export default function (component) {
 
   let root = parentElement.querySelector(".mvk-root");
   if (!root) root = el("div", "mvk-root", parentElement);
-  const config = JSON.stringify(data);
+  const { previewOn, ...base } = data;      // switching the preview on/off must not rebuild the grid
+  const config = JSON.stringify(base);
   if (!root.__viewer || root.__config !== config) {
     if (root.__viewer) root.__viewer.destroy();
-    root.__viewer = buildViewer(root, data);
+    root.__viewer = buildViewer(root, base);
     root.__config = config;
   }
   const viewer = root.__viewer;
+  viewer.setPreviewOn(Boolean(previewOn));
   viewer.setStateValue = setStateValue;
   viewer.setTriggerValue = setTriggerValue;
 
@@ -444,7 +446,8 @@ export default function (component) {
     if (e.key === "Escape" && viewer.drag) { viewer.endDrag(false); return; }
     if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
     if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || isTyping(e)) return;
-    if (!root.isConnected || document.querySelector('[role="dialog"]')) return;
+    if (!root.isConnected || !root.getClientRects().length) return;   // hidden while the preview is on
+    if (document.querySelector('[role="dialog"]')) return;
     e.preventDefault();
     if (e.repeat) return;                  // holding the key is handled by the paced repeater
     const dir = e.key === "ArrowRight" ? 1 : -1;

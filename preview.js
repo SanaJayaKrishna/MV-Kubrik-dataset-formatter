@@ -8,6 +8,7 @@
 // (15 FPS -> every 2nd frame, 10 FPS -> every 3rd, 12 FPS -> frames 0, 3, 5, 8, 10, ...).
 //
 // Play button: click = play / pause, double-click = stop and go back to the start frame.
+// Preview toggle (on): switches the pane back to the multi-view viewer.
 //
 // Ground truth overlay (data.gt, set by the checkbox and object picker in app.py): for each
 // selected object a point cloud of 26 points on its ground-truth 3D box (8 corners, 12 edge
@@ -130,6 +131,9 @@ function buildPlayer(root, data) {
   fpsInput.title = `Frames shown per second (1 to ${src}); playback stays real time`;
   const status = el("span", "mvk-status mvk-player-status", bar);
   const note = el("div", "mvk-player-note", root);
+  const actions = el("div", "mvk-actions", root);
+  const toggle = makeToggle(actions, "Preview", true);
+  toggle.title = "Switch back to the multi-view viewer";
 
   const host = root.getRootNode().host;
   const theme = host ? getComputedStyle(host) : null;
@@ -153,6 +157,7 @@ function buildPlayer(root, data) {
     warmAt: 0,
     stillToken: 0,
     setStateValue: null,
+    setTriggerValue: null,
     syncTimer: 0,
     observer: null,
     gt: { on: false, objects: [], trail: src },   // overlay settings from app.py
@@ -456,6 +461,12 @@ function buildPlayer(root, data) {
     prefetch();
   }
 
+  toggle.addEventListener("click", () => {
+    if (!p.setTriggerValue) return;
+    toggle.setChecked(false);
+    pause();
+    p.setTriggerValue("close", true);
+  });
   play.addEventListener("click", (e) => {
     if (e.detail === 2) stop();                      // second click of a double-click
     else if (e.detail <= 1) (p.playing ? pause : start)();
@@ -470,10 +481,10 @@ function buildPlayer(root, data) {
   });
 
   // With a fixed panel height (bottom or corner handle) the canvas scales to fit inside it.
-  const panel = host ? host.closest(".st-key-mvk_preview") : null;
+  const panel = host ? host.closest(".st-key-mvk_panel") : null;   // the pane shared with the viewer
   const fit = () => {
     resizeCanvas();
-    const room = roomForContent(panel, "--mvk-preview-h", root, stage);
+    const room = roomForContent(panel, "--mvk-panel-h", root, stage);
     const width = room === null ? null : Math.max(160, (room * canvas.width) / canvas.height);
     const next = width !== null && width < root.getBoundingClientRect().width ? `${Math.floor(width)}px` : "";
     if (stage.style.width !== next) { stage.style.width = next; resizeCanvas(); }
@@ -499,7 +510,7 @@ function buildPlayer(root, data) {
 }
 
 export default function (component) {
-  const { data, parentElement, setStateValue } = component;
+  const { data, parentElement, setStateValue, setTriggerValue } = component;
   if (!data || !data.runs || !data.runs.length) return;
   let root = parentElement.querySelector(".mvk-root");
   if (!root) root = el("div", "mvk-root", parentElement);
@@ -512,6 +523,7 @@ export default function (component) {
     root.__gt = undefined;
   }
   root.__player.setStateValue = setStateValue;
+  root.__player.setTriggerValue = setTriggerValue;
   const gtConfig = JSON.stringify(gt || null);
   if (root.__gt !== gtConfig) {
     root.__gt = gtConfig;
