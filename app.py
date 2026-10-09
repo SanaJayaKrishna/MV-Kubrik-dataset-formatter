@@ -8,7 +8,8 @@ shows the same frame of every view in an m x n grid and steps all views together
 Start with ~/mvkubric_app/run.sh and open http://localhost:8501.
 
 Files: serve.py (entry point, mounts the image routes), previews.py (dataset
-index and preview images), viewer.js / viewer.css (the grid, runs in the browser).
+index and preview images), viewer.js / viewer.css (the grid, runs in the browser),
+resizer.js (drag handle that resizes the viewer panel).
 Later phases will add the conversion to MV-Kubric
 (see ~/docker/isaac-sim/workspace/convert_to_mvkubric.py).
 """
@@ -39,6 +40,12 @@ def load_dataset(root: str, signature: tuple) -> pv.Dataset:
 def grid_component(js: str, css: str):
     """Register the browser-side grid once (again only if viewer.js/css change)."""
     return st.components.v2.component("mv_frame_grid", js=js, css=css)
+
+
+@st.cache_resource
+def resizer_component(js: str):
+    """Drag handle on the viewer panel; it works on the page DOM, so no style isolation."""
+    return st.components.v2.component("mv_panel_resizer", js=js, isolate_styles=False)
 
 
 def auto_grid(n_views: int) -> tuple[int, int]:
@@ -139,22 +146,25 @@ def browse_dialog() -> None:
 # --------------------------------------------------------------------------- viewer
 
 def viewer_data(ds: pv.Dataset, rows: int, cols: int) -> dict:
-    """Everything the browser-side grid needs (frame lists are sent as compact runs)."""
-    shown = list(range(min(rows * cols, len(ds.views))))
+    """Everything the browser-side grid needs (frame lists are sent as compact runs).
+
+    All views are sent; the grid shows rows x cols tiles and the user arranges
+    which view goes on which tile (saved per dataset folder in the browser).
+    """
     missing = {}
-    for i, v in enumerate(shown):
-        if len(ds.frames[v]) != len(ds.timeline):
-            missing[str(i)] = pv.to_runs(f for f in ds.timeline if f not in ds.frames[v])
+    for v, frames in enumerate(ds.frames):
+        if len(frames) != len(ds.timeline):
+            missing[str(v)] = pv.to_runs(f for f in ds.timeline if f not in frames)
     return {
         "ds": ds.id,
         "root": ds.root,
         "base": pv.ROUTE_PREFIX,
-        "views": [ds.views[v] for v in shown],
-        "viewIdx": shown,
-        "names": [ds.name_patterns[v] for v in shown],
+        "views": list(ds.views),
+        "names": list(ds.name_patterns),
         "runs": pv.to_runs(ds.timeline),
         "missing": missing,
         "cols": cols,
+        "cells": rows * cols,
         "w": pv.preview_width(cols, ds.image_size),
         "size": list(ds.image_size or (16, 9)),
     }
@@ -162,12 +172,40 @@ def viewer_data(ds: pv.Dataset, rows: int, cols: int) -> dict:
 
 @st.fragment
 def viewer(ds: pv.Dataset, rows: int, cols: int) -> None:
-    # The grid steps frames in the browser. It reports the current frame back
-    # (st.session_state.viewer["frame"]) once navigation pauses, for later phases;
-    # being a fragment, that report reruns only this part of the page.
+    # The grid steps frames in the browser. Once navigation pauses it reports the
+    # frame (st.session_state.viewer["frame"]) and, after a rearrangement, the
+    # tile order as view names (st.session_state.viewer["layout"]) for later
+    # phases; being a fragment, those reports rerun only this part of the page.
     grid = grid_component((HERE / "viewer.js").read_text(), (HERE / "viewer.css").read_text())
-    grid(key="viewer", data=viewer_data(ds, rows, cols), default={"frame": ds.timeline[0]},
-         on_frame_change=lambda: None)
+    grid(key="viewer", data=viewer_data(ds, rows, cols), default={"frame": ds.timeline[0], "layout": None},
+         on_frame_change=lambda: None, on_layout_change=lambda: None)
+
+
+def dataset_info(ds: pv.Dataset) -> None:
+    w, h = ds.image_size or (0, 0)
+    st.markdown("##### Dataset")
+    st.caption(ds.root)
+    st.markdown(f"**{len(ds.views)}** view{'s' if len(ds.views) != 1 else ''}  ·  "
+                f"**{len(ds.timeline)}** frames ({ds.timeline[0]} to {ds.timeline[-1]})  ·  {w}×{h} px")
+    if len({len(f) for f in ds.frames}) > 1:
+        st.caption(":orange[Views have different frame counts; missing frames show as empty tiles.]")
+    st.dataframe(
+        [{"View": name, "Frames": len(frames), "Missing": len(ds.timeline) - len(frames)}
+         for name, frames in zip(ds.views, ds.frames)],
+        hide_index=True, width="stretch")
+
+
+def controls_help() -> None:
+    st.markdown("##### Controls")
+    st.markdown(
+        "- **Step:** click ‹ or › or press the Left / Right arrow key. Hold it to keep stepping "
+        "(about 30 frames per second); add Shift to step 10 frames.\n"
+        "- **Jump:** type a frame number in the box and press Enter.\n"
+        "- **Arrange views:** press the right mouse button on a view, drag it onto another tile "
+        "and release; the two swap places. The arrangement is remembered per dataset folder.\n"
+        "- **Resize:** drag the handle on the viewer's right edge; double-click it to reset. "
+        "This panel moves beside or below the viewer to fit.")
+    st.caption("MV-Kubric conversion will be added here in a later phase.")
 
 
 # --------------------------------------------------------------------------- page
@@ -178,6 +216,29 @@ CSS = """
 [data-testid="stMainBlockContainer"] { padding-top: 3rem; padding-bottom: 1rem; }
 /* Keep the grid fully visible during reruns (no fade-out). */
 [data-testid="stElementContainer"][data-stale="true"] { opacity: 1 !important; transition: none !important; }
+
+/* Viewer panel + side panel: the viewer's width is set by dragging its edge (resizer.js
+   stores it in --mvk-panel-w); the side panel sits beside it when it fits, else wraps below. */
+.st-key-mvk_layout { align-items: flex-start; }
+.st-key-mvk_layout > [data-testid="stLayoutWrapper"]:has(> .st-key-mvk_panel) {
+  flex: 0 0 auto; width: var(--mvk-panel-w, 70%); min-width: min(380px, 100%); max-width: 100%;
+  position: relative;
+}
+.st-key-mvk_layout > [data-testid="stLayoutWrapper"]:has(> .st-key-mvk_side) { flex: 1 1 300px; min-width: 280px; }
+.st-key-panel_resizer { display: none; }
+.st-key-mvk_controls .st-key-folder { flex: 1 1 320px !important; min-width: 220px; }
+.mvk-resize-handle {
+  position: absolute; top: 0; bottom: 0; right: -14px; width: 12px; z-index: 10;
+  display: flex; align-items: center; justify-content: center; cursor: col-resize; touch-action: none;
+}
+.mvk-resize-handle::after {
+  content: ""; width: 4px; height: 56px; border-radius: 2px;
+  background: rgba(128, 128, 128, 0.45); transition: background 0.15s, height 0.15s;
+}
+.mvk-resize-handle:hover::after, .mvk-resize-handle.mvk-active::after {
+  background: var(--mvk-accent, #ff4b4b); height: 120px;
+}
+body.mvk-resizing, body.mvk-resizing * { cursor: col-resize !important; user-select: none !important; }
 </style>
 """
 
@@ -189,48 +250,55 @@ def main() -> None:
     if "folder" not in ss:
         ss.folder = DEFAULT_FOLDER if os.path.isdir(DEFAULT_FOLDER) else ""
 
-    st.markdown("##### Multi-view dataset viewer")
     if os.environ.get(pv.ROUTES_ENV) != "1":
         st.error("The image routes are not running. Start the app with `~/mvkubric_app/run.sh` "
                  "(it runs `streamlit run serve.py`), not `streamlit run app.py`.")
         return
 
-    c_path, c_browse, c_rows, c_cols = st.columns([8, 1.3, 1.1, 1.1], vertical_alignment="bottom")
-    c_path.text_input("Dataset folder", key="folder", placeholder=DEFAULT_FOLDER,
-                      help="Full path of a recording folder whose subfolders (view01, view02, ... "
-                           "or Replicator_XX) each contain an rgb/ folder with rgb_<frame>.png files.")
-    if c_browse.button("Browse...", icon=":material/folder_open:", width="stretch"):
-        ss.browse_dir = str(existing_dir(ss.folder))
-        browse_dialog()
+    # One resizable unit (folder, grid size, grid) and a side panel that flows around it.
+    with st.container(horizontal=True, key="mvk_layout"):
+        panel = st.container(border=True, key="mvk_panel")
+        side = st.container(key="mvk_side")
 
-    ds = open_dataset(clean_path(ss.folder))
-    if ds is None:
-        # The grid-size widgets were not drawn, so Streamlit forgets their values;
-        # make the next valid folder start again from the default grid.
-        ss.pop("loaded_root", None)
-        return
-    pv.register(ds)
+    with panel:
+        resizer_component((HERE / "resizer.js").read_text())(key="panel_resizer", data={"panel": "mvk_panel"})
+        st.markdown("##### Multi-view dataset viewer")
+        controls = st.container(horizontal=True, vertical_alignment="bottom", key="mvk_controls")
+        controls.text_input("Dataset folder", key="folder", placeholder=DEFAULT_FOLDER,
+                            help="Full path of a recording folder whose subfolders (view01, view02, ... "
+                                 "or Replicator_XX) each contain an rgb/ folder with rgb_<frame>.png files.")
+        if controls.button("Browse...", icon=":material/folder_open:"):
+            ss.browse_dir = str(existing_dir(ss.folder))
+            browse_dialog()
+        grid_size = controls.container(horizontal=True, vertical_alignment="bottom", width="content")
 
-    # A new dataset folder resets the grid shape to fit its number of views.
-    if ss.get("loaded_root") != ds.root:
-        ss.loaded_root = ds.root
-        ss.rows, ss.cols = auto_grid(len(ds.views))
+        ds = open_dataset(clean_path(ss.folder))
+        if ds is None:
+            # The grid-size widgets were not drawn, so Streamlit forgets their values;
+            # make the next valid folder start again from the default grid.
+            ss.pop("loaded_root", None)
+            with side:
+                controls_help()
+            return
+        pv.register(ds)
 
-    rows = int(c_rows.number_input("Rows (m)", key="rows", min_value=1, max_value=MAX_GRID, step=1))
-    cols = int(c_cols.number_input("Columns (n)", key="cols", min_value=1, max_value=MAX_GRID, step=1))
+        # A new dataset folder resets the grid shape to fit its number of views.
+        if ss.get("loaded_root") != ds.root:
+            ss.loaded_root = ds.root
+            ss.rows, ss.cols = auto_grid(len(ds.views))
 
-    w, h = ds.image_size or (0, 0)
-    plural = "s" if len(ds.views) != 1 else ""
-    info = (f"**{len(ds.views)} view{plural}**: {', '.join(ds.views)}  ·  **{len(ds.timeline)} frames** "
-            f"({ds.timeline[0]} to {ds.timeline[-1]})  ·  {w}×{h} px  ·  "
-            f"keys: ← → step a frame, Shift + ← → step 10")
-    if len({len(f) for f in ds.frames}) > 1:
-        info += "  ·  :orange[views have different frame counts; missing frames show as empty tiles]"
-    if rows * cols < len(ds.views):
-        info += f"  ·  :orange[grid shows {rows * cols} of {len(ds.views)} views]"
-    st.caption(info)
+        rows = int(grid_size.number_input("Rows (m)", key="rows", min_value=1, max_value=MAX_GRID, step=1,
+                                         width=130))
+        cols = int(grid_size.number_input("Columns (n)", key="cols", min_value=1, max_value=MAX_GRID, step=1,
+                                         width=130))
+        if rows * cols < len(ds.views):
+            st.caption(f":orange[The grid has {rows * cols} tiles for {len(ds.views)} views. "
+                       "Enlarge it to bring the hidden views in and arrange them.]")
+        viewer(ds, rows, cols)
 
-    viewer(ds, rows, cols)
+    with side:
+        dataset_info(ds)
+        controls_help()
 
 
 main()
