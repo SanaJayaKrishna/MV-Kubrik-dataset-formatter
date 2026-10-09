@@ -17,6 +17,11 @@
 const GAP = 8;                // canvas pixels between tiles
 const PRELOAD_SECONDS = 1.5;  // browser preloads this much of the upcoming playback
 const WARM_SECONDS = 4;       // the server decodes this much ahead (at most 128 frames)
+const WIDTHS = [160, 240, 320, 480, 640, 854, 1280];   // image widths requested from the server
+const PREROLL_SECONDS = 0.6; // Play starts once this much upcoming video is loaded...
+const PREROLL_MAX_MS = 2000;  // ...or after this long at most
+
+preloader.limit = 6;          // while the preview plays the viewer is idle: use every browser connection
 
 const savedFps = new Map();   // dataset folder -> playback FPS
 const jsonCache = new Map();  // url -> Promise<object | null>
@@ -59,6 +64,10 @@ function buildPlayer(root, data) {
   // resolution; resizeCanvas() updates them when the pane changes size.
   let tileW = data.w;
   let tileH = Math.round((data.w * imgH) / imgW);
+  // Images are requested at the smallest standard width that covers a tile, so a small pane
+  // does not make the browser decode far more pixels than it shows.
+  const widthFor = (w) => Math.min(data.w, WIDTHS.find((x) => x >= w) || data.w);
+  let imageW = data.w;
   const shownViews = data.tiles.filter((view) => view >= 0);
 
   const stage = el("div", "mvk-stage", root);          // canvas + view labels on top of it
@@ -94,7 +103,15 @@ function buildPlayer(root, data) {
     canvas.width = cols * tileW + (cols - 1) * GAP;
     canvas.height = rows * tileH + (rows - 1) * GAP;
     placeTags();
-    if (p.shown !== null) draw(p.shown);
+    const nextImageW = widthFor(tileW);
+    if (nextImageW !== imageW) {           // new image size: reload the frame on screen, then preload
+      imageW = nextImageW;
+      const frame = p.shown;
+      if (frame !== null) request(frame).then(() => { if (p.shown === frame) draw(frame); });
+      prefetch();
+    } else if (p.shown !== null) {
+      draw(p.shown);
+    }
   }
   placeTags();
 
@@ -132,6 +149,7 @@ function buildPlayer(root, data) {
     raf: 0,
     nextDue: 0,
     shown: null,            // recorded frame number on the canvas
+    preroll: 0,             // time Play was pressed while still waiting for the first frames
     warmAt: 0,
     stillToken: 0,
     setStateValue: null,
@@ -145,7 +163,7 @@ function buildPlayer(root, data) {
   const warm = makeWarmer();
   const tlIndex = new Map(timeline.map((f, i) => [f, i]));
 
-  const url = (view, frame) => `${data.base}/preview/${data.ds}/${view}/${frame}?w=${data.w}`;
+  const url = (view, frame) => `${data.base}/preview/${data.ds}/${view}/${frame}?w=${imageW}`;
   const urlsFor = (frame) => data.tiles.map((view) =>
     (view >= 0 && !missing[view].has(frame) ? url(view, frame) : null));
 
@@ -175,6 +193,8 @@ function buildPlayer(root, data) {
       const entry = urls[t] && pool.get(urls[t]);
       if (entry && entry.state === "ok") {
         ctx.drawImage(entry.img, x, y, tileW, tileH);
+      } else if (urls[t] && (!entry || entry.state === "loading")) {
+        // still loading (the pane was just resized): leave the tile blank for a moment
       } else {
         ctx.fillStyle = mutedText;
         ctx.font = `${Math.max(14, Math.round(tileH * 0.05))}px ${font}`;
@@ -341,7 +361,7 @@ function buildPlayer(root, data) {
     const now = performance.now();
     if (upcoming.length && now - p.warmAt > 400) {
       p.warmAt = now;
-      warm(`${data.base}/warm/${data.ds}?w=${data.w}&v=${shownViews.join(",")}&f=${upcoming.join(",")}`);
+      warm(`${data.base}/warm/${data.ds}?w=${imageW}&v=${shownViews.join(",")}&f=${upcoming.join(",")}`);
     }
   }
 
@@ -361,6 +381,19 @@ function buildPlayer(root, data) {
     if (now < p.nextDue) return;
     const frame = target(p.k);
     if (frame === null) { finish(); return; }
+    if (p.preroll) {          // just pressed Play: start once the next frames are loaded
+      const upcoming = [];
+      const count = Math.max(4, Math.ceil(p.fps * PREROLL_SECONDS));
+      for (let j = 0; j < count; j++) { const f = target(p.k + j); if (f !== null) upcoming.push(f); }
+      if (!upcoming.every(ready) && now - p.preroll < PREROLL_MAX_MS) {
+        upcoming.forEach(request);
+        status.classList.add("mvk-loading");
+        return;
+      }
+      p.preroll = 0;
+      status.classList.remove("mvk-loading");
+      p.nextDue = now;
+    }
     if (!ready(frame)) { p.stats.waits++; request(frame); return; }   // wait for the images, never skip a frame
     draw(frame);
     p.k++;
@@ -379,6 +412,7 @@ function buildPlayer(root, data) {
     if (restart) { p.anchor = p.origin; p.k = 0; p.ended = false; }
     p.stillToken++;
     p.playing = true;
+    p.preroll = performance.now();
     p.nextDue = performance.now() + (restart ? 0 : 1000 / p.fps);
     setIcon();
     updateStatus();
@@ -459,6 +493,7 @@ function buildPlayer(root, data) {
   ctx.fillStyle = tileBg;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   updateStatus();
+  resizeCanvas();           // pick the canvas and image size before the first image request
   showStill(0);
   return p;
 }

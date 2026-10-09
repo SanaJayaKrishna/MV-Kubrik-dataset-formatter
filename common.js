@@ -43,6 +43,7 @@ function loadState(url) {     // null (never requested), "loading", "ok" or "err
 }
 
 const preloader = {
+  limit: PRELOAD_PARALLEL,    // requests in flight at most (the preview player raises it)
   queue: [],
   active: 0,
   set(urls) {
@@ -50,7 +51,7 @@ const preloader = {
     this.pump();
   },
   pump() {
-    while (this.active < PRELOAD_PARALLEL && this.queue.length) {
+    while (this.active < this.limit && this.queue.length) {
       const url = this.queue.shift();
       if (pool.has(url)) continue;
       this.active++;
