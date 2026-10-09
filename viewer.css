@@ -112,3 +112,7 @@
 .mvk-grid { user-select: none; }
 .mvk-cell:not(.mvk-empty) .mvk-frame { cursor: grab; }
 .mvk-dragging, .mvk-dragging .mvk-frame { cursor: grabbing !important; }
+
+/* Preview button under the navigation row. */
+.mvk-actions { display: flex; justify-content: center; margin-top: 0.5rem; }
+.mvk-btn-wide { gap: 0.4rem; padding: 0 1rem; font: inherit; font-size: 0.95rem; }

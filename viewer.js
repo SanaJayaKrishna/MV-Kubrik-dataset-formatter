@@ -1,4 +1,4 @@
-// Synchronized multi-view frame grid (Streamlit components v2 module).
+// Synchronized multi-view frame grid (Streamlit components v2 module; app.py prepends common.js).
 //
 // Navigation runs entirely in the browser, so stepping never waits for a
 // Streamlit rerun. Images come from the app's /mvk/preview route; the next
@@ -9,13 +9,12 @@
 //   < > buttons, Left/Right keys    step one frame; hold to keep stepping (Shift: 10)
 //   frame box + Enter               jump to the nearest existing frame
 //   left-button drag on a view      drop it on another tile to swap the two
+//   Preview button                  opens the preview pane at this frame with this arrangement
 
 const AHEAD = 12;             // frames preloaded by the browser in the direction of travel
 const BEHIND = 4;             // ...and behind
 const WARM_AHEAD = 40;        // frames the server decodes in advance
 const WARM_BEHIND = 8;
-const PRELOAD_PARALLEL = 4;   // leaves browser connections free for the frame on screen
-const POOL_MAX = 800;         // preloaded images kept alive (about 90 KB each)
 const SYNC_DELAY_MS = 400;    // report the frame to Python once navigation pauses
 const HOLD_DELAY_MS = 350;    // press and hold: repeating starts after this...
 const HOLD_INTERVAL_MS = 33;  // ...then about 30 steps per second, each shown before the next
@@ -24,86 +23,7 @@ const DRAG_THRESHOLD_PX = 6;  // a press on a view becomes a drag after moving t
 const savedFrame = new Map(); // dataset folder -> current frame number (survives reruns)
 const savedSlots = new Map(); // dataset folder -> tile arrangement as view names (null = empty tile)
 
-// ------------------------------------------------------------------ image pool
-
-const pool = new Map();       // url -> {img, ready: Promise<boolean>}
-
-function load(url, priority) {
-  let entry = pool.get(url);
-  if (entry) {                // LRU touch
-    pool.delete(url);
-    pool.set(url, entry);
-    return entry.ready;
-  }
-  const img = new Image();
-  img.decoding = "async";
-  img.fetchPriority = priority;
-  const ready = new Promise((resolve) => {
-    img.onload = () => img.decode().then(() => resolve(true), () => resolve(true));
-    img.onerror = () => {
-      pool.delete(url);       // retry next time (e.g. a frame that was still being written)
-      resolve(false);
-    };
-  });
-  img.src = url;
-  entry = { img, ready };
-  pool.set(url, entry);
-  while (pool.size > POOL_MAX) pool.delete(pool.keys().next().value);
-  return ready;
-}
-
-const preloader = {
-  queue: [],
-  active: 0,
-  set(urls) {
-    this.queue = urls.filter((u) => !pool.has(u));
-    this.pump();
-  },
-  pump() {
-    while (this.active < PRELOAD_PARALLEL && this.queue.length) {
-      const url = this.queue.shift();
-      if (pool.has(url)) continue;
-      this.active++;
-      load(url, "low").finally(() => {
-        this.active--;
-        this.pump();
-      });
-    }
-  },
-};
-
-// ------------------------------------------------------------------ helpers
-
-function expandRuns(runs) {
-  const out = [];
-  for (const [a, b] of runs) for (let f = a; f <= b; f++) out.push(f);
-  return out;
-}
-
-function nearestIndex(timeline, frame) {
-  let lo = 0, hi = timeline.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (timeline[mid] < frame) lo = mid + 1; else hi = mid;
-  }
-  if (lo > 0 && frame - timeline[lo - 1] <= timeline[lo] - frame) return lo - 1;
-  return lo;
-}
-
-function el(tag, cls, parent) {
-  const e = document.createElement(tag);
-  if (cls) e.className = cls;
-  if (parent) parent.appendChild(e);
-  return e;
-}
-
-function storageGet(key) {
-  try { return localStorage.getItem(key); } catch (e) { return null; }
-}
-
-function storageSet(key, value) {
-  try { localStorage.setItem(key, value); } catch (e) { /* storage blocked */ }
-}
+// ------------------------------------------------------------------ helpers (see also common.js)
 
 function restoreFrame(root) {        // frame shown before a browser reload, if any
   try {
@@ -194,6 +114,11 @@ function buildViewer(root, data) {
   next.title = "Next frame (Right arrow). Hold to keep stepping, Shift for 10";
   next.setAttribute("aria-label", "Next frame");
   const status = el("span", "mvk-status", nav);
+  const actions = el("div", "mvk-actions", root);
+  const previewBtn = el("button", "mvk-btn mvk-btn-wide", actions);
+  previewBtn.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M8 5v14l11-7z" ` +
+    `fill="currentColor"/></svg><span>Preview</span>`;
+  previewBtn.title = "Open the preview pane, starting at this frame with this arrangement";
 
   const v = {
     idx: nearestIndex(timeline, savedFrame.get(data.root) ?? restoreFrame(data.root)),
@@ -205,10 +130,10 @@ function buildViewer(root, data) {
     drag: null,             // drag state while rearranging tiles
     observer: null,         // ResizeObserver that refits the grid to the panel height
     setStateValue: null,
+    setTriggerValue: null,
     syncTimer: 0,
-    warmBusy: false,
-    warmNext: null,
   };
+  const warm = makeWarmer();
 
   const url = (view, frame) => `${data.base}/preview/${data.ds}/${view}/${frame}?w=${data.w}`;
   const has = (view, frame) => !missing[view].has(frame);
@@ -281,29 +206,13 @@ function buildViewer(root, data) {
     paint();
   }
 
-  function warm(frames) {                  // ask the server to decode upcoming frames
-    v.warmNext = `${data.base}/warm/${data.ds}?w=${data.w}&v=${visibleViews().join(",")}&f=${frames.join(",")}`;
-    if (!v.warmBusy) sendWarm();
-  }
-
-  function sendWarm() {                    // at most one request in flight, latest one wins
-    const query = v.warmNext;
-    v.warmNext = null;
-    if (!query) return;
-    v.warmBusy = true;
-    fetch(query, { cache: "no-store" }).catch(() => {}).finally(() => {
-      v.warmBusy = false;
-      sendWarm();
-    });
-  }
-
   function prefetch(i, delta) {           // delta: last step (+-1, or +-10 with Shift)
     const ranked = [];
     for (let k = 1; k <= WARM_AHEAD; k++) ranked.push([k, i + delta * k]);
     for (let k = 1; k <= WARM_BEHIND; k++) ranked.push([2.5 * k, i - delta * k]);
     ranked.sort((a, b) => a[0] - b[0]);
     const order = ranked.filter((r) => r[1] >= 0 && r[1] < n);
-    warm(order.map((r) => timeline[r[1]]));
+    warm(`${data.base}/warm/${data.ds}?w=${data.w}&v=${visibleViews().join(",")}&f=${order.map((r) => timeline[r[1]]).join(",")}`);
     const near = order.filter((r) => r[0] <= AHEAD).map((r) => r[1]);   // the nearest steps both ways
     const views = visibleViews();
     const urls = [];
@@ -379,6 +288,15 @@ function buildViewer(root, data) {
     }
     button.addEventListener("click", (e) => { if (e.detail === 0) v.step(dir); });  // Enter/Space when focused
   }
+
+  previewBtn.addEventListener("click", () => {
+    if (!v.setTriggerValue) return;
+    v.setTriggerValue("preview", {
+      frame: timeline[v.idx],
+      tiles: slots.slice(0, data.cells).map((view) => (view >= 0 ? data.views[view] : null)),
+      cols: data.cols,
+    });
+  });
 
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); jumpToInput(); input.blur(); }
@@ -462,22 +380,17 @@ function buildViewer(root, data) {
   // ---- fit the grid into the panel when the panel has a fixed height (bottom/corner handle)
 
   function fit() {
-    const panel = v.panel;
-    const fixed = panel && getComputedStyle(document.documentElement).getPropertyValue("--mvk-panel-h").trim();
-    if (!fixed || !root.isConnected) {
+    const room = roomForContent(v.panel, "--mvk-panel-h", root, grid);
+    if (room === null) {
       if (grid.style.width) grid.style.width = "";
       return;
     }
-    const ps = getComputedStyle(panel);
-    const bottom = panel.getBoundingClientRect().bottom - parseFloat(ps.paddingBottom) - parseFloat(ps.borderBottomWidth);
-    const navSpace = nav.getBoundingClientRect().height + parseFloat(getComputedStyle(nav).marginTop);
     const gs = getComputedStyle(grid);
     const rowGap = parseFloat(gs.rowGap) || 0;
     const colGap = parseFloat(gs.columnGap) || 0;
     const cap = tiles[0].cap;
     const capSpace = cap.getBoundingClientRect().height + parseFloat(getComputedStyle(cap).marginTop);
     const rows = Math.ceil(data.cells / data.cols);
-    const room = bottom - grid.getBoundingClientRect().top - navSpace - 4;
     const tileH = (room - (rows - 1) * rowGap) / rows - capSpace;
     const width = Math.max(data.cols * 48, data.cols * (tileH * imgW) / imgH + (data.cols - 1) * colGap);
     const next = width < root.getBoundingClientRect().width ? `${Math.floor(width)}px` : "";
@@ -512,7 +425,7 @@ function isTyping(e) {
 }
 
 export default function (component) {
-  const { data, parentElement, setStateValue } = component;
+  const { data, parentElement, setStateValue, setTriggerValue } = component;
   if (!data || !data.runs || !data.runs.length) return;
 
   let root = parentElement.querySelector(".mvk-root");
@@ -525,6 +438,7 @@ export default function (component) {
   }
   const viewer = root.__viewer;
   viewer.setStateValue = setStateValue;
+  viewer.setTriggerValue = setTriggerValue;
 
   const onKeyDown = (e) => {
     if (e.key === "Escape" && viewer.drag) { viewer.endDrag(false); return; }

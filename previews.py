@@ -13,19 +13,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import math
+import multiprocessing
 import os
 import re
 import threading
 from collections import OrderedDict
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image
 from starlette.requests import Request
 from starlette.responses import Response
+
+import frame_decoder
 
 ROUTE_PREFIX = "/mvk"
 ROUTES_ENV = "MVK_PREVIEW_ROUTES"   # set by serve.py when the routes are mounted
@@ -35,7 +37,6 @@ ROUTES_ENV = "MVK_PREVIEW_ROUTES"   # set by serve.py when the routes are mounte
 FRAME_RE = re.compile(r"(\d+)\.png$", re.IGNORECASE)
 
 CACHE_BYTES = 1 << 30   # ~1 GB of preview JPEGs (about 90 KB each at 854 px wide)
-JPEG_QUALITY = 85
 MAX_WARM = 512          # background decodes queued at most
 MAX_DATASETS = 16       # datasets kept registered for the image route
 
@@ -151,51 +152,45 @@ def preview_width(cols: int, image_size: tuple[int, int] | None) -> int:
 
 # --------------------------------------------------------------------------- preview cache
 
-def render_preview(path: str, width: int) -> bytes:
-    """Decode a PNG, downscale it to the preview width and encode it as JPEG."""
-    with Image.open(path) as im:
-        im = im.convert("RGB")  # Isaac Sim writes RGBA with an opaque alpha channel
-        if im.width > width:
-            im = im.resize((width, round(im.height * width / im.width)), Image.Resampling.BILINEAR)
-        buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=JPEG_QUALITY)
-        return buf.getvalue()
-
-
 class PreviewCache:
-    """Thread-safe LRU cache of preview JPEGs.
+    """Thread-safe LRU cache of preview JPEGs, decoded in worker processes (see frame_decoder.py).
 
-    Decoding one 1280x720 PNG takes about 35 ms. Pillow releases the GIL while
-    decoding, so thread pools decode many images in parallel: one pool serves
-    images the browser is waiting for, a second one decodes upcoming frames in
-    the background ("warm-up") so they are ready before they are requested.
+    Two process pools: a small one for images the browser is waiting for, a larger one
+    that decodes upcoming frames in the background ("warm-up"), so requests for the frame
+    on screen never queue behind warm-up work. Pools start on first use.
     """
 
     def __init__(self, max_bytes: int) -> None:
         self._max = max_bytes
         self._items: OrderedDict[tuple[str, int], bytes] = OrderedDict()
         self._size = 0
-        self._lock = threading.Lock()
-        workers = min(16, os.cpu_count() or 4)
-        self._now = ThreadPoolExecutor(workers, thread_name_prefix="preview")
-        self._bg = ThreadPoolExecutor(workers, thread_name_prefix="warmup")
+        self._lock = threading.RLock()   # re-entrant: Future callbacks may run while it is held
+        self._now: ProcessPoolExecutor | None = None
+        self._bg: ProcessPoolExecutor | None = None
         self._inflight: dict[tuple[str, int], Future] = {}
         self._warming: dict[tuple[str, int], Future] = {}
 
-    def _build(self, key: tuple[str, int]) -> bytes:
-        try:
-            data = render_preview(*key)
-            with self._lock:
-                if key not in self._items:
-                    self._items[key] = data
-                    self._size += len(data)
-                    while self._size > self._max and self._items:
-                        _, old = self._items.popitem(last=False)
-                        self._size -= len(old)
-            return data
-        finally:
-            with self._lock:
-                self._inflight.pop(key, None)
+    def _pools(self) -> tuple[ProcessPoolExecutor, ProcessPoolExecutor]:
+        if self._now is None:
+            cores = os.cpu_count() or 4
+            options = dict(mp_context=multiprocessing.get_context("forkserver"),
+                           initializer=frame_decoder.watch_server, initargs=(os.getpid(),))
+            self._now = ProcessPoolExecutor(max(2, min(6, cores // 4)), **options)
+            self._bg = ProcessPoolExecutor(max(2, min(16, cores // 2 - 6)), **options)
+        return self._now, self._bg
+
+    def _done(self, key: tuple[str, int], fut: Future) -> None:
+        with self._lock:
+            if self._inflight.get(key) is fut:
+                del self._inflight[key]
+            if fut.cancelled() or fut.exception() is not None or key in self._items:
+                return
+            data = fut.result()
+            self._items[key] = data
+            self._size += len(data)
+            while self._size > self._max and self._items:
+                _, old = self._items.popitem(last=False)
+                self._size -= len(old)
 
     def _future(self, key: tuple[str, int], urgent: bool) -> Future:
         """Caller holds the lock."""
@@ -207,11 +202,13 @@ class PreviewCache:
             return done
         fut = self._inflight.get(key)
         # An urgent request must not wait behind queued warm-up work: take the job over.
-        if fut is not None and urgent and not fut.running() and fut.cancel():
+        if fut is not None and urgent and fut.cancel():
             fut = None
         if fut is None:
-            fut = (self._now if urgent else self._bg).submit(self._build, key)
+            now, bg = self._pools()
+            fut = (now if urgent else bg).submit(frame_decoder.render_preview, *key)
             self._inflight[key] = fut
+            fut.add_done_callback(lambda f, key=key: self._done(key, f))
             if not urgent:
                 self._warming[key] = fut
         return fut
@@ -226,12 +223,8 @@ class PreviewCache:
         wanted = set(keys)
         with self._lock:
             for key, fut in list(self._warming.items()):
-                if fut.done():
+                if fut.done() or (key not in wanted and fut.cancel()):
                     del self._warming[key]
-                elif key not in wanted and fut.cancel():
-                    del self._warming[key]
-                    if self._inflight.get(key) is fut:
-                        del self._inflight[key]
             for key in keys:
                 if len(self._warming) >= MAX_WARM:
                     break

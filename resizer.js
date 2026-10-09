@@ -1,31 +1,15 @@
-// Resize handles for the viewer panel (Streamlit components v2 module).
+// Resize handles for a panel (Streamlit components v2 module); used for the viewer and the preview.
 //   right edge: width    bottom edge: height    corner: both
-// Sizes are kept in CSS variables (--mvk-panel-w / --mvk-panel-h, read by the page CSS in
-// app.py) and in localStorage; double-click a handle to go back to the default size.
-// With a fixed height the grid (viewer.js) scales itself to fit inside the panel.
+// data = {panel: <container key>, name: <"panel" | "preview">}. Sizes are kept in CSS variables
+// (--mvk-<name>-w / -h / -grow, read by the page CSS in app.py) and in localStorage; double-click
+// a handle to go back to the default size. With a fixed height the content scales to fit.
 
-const AXES = {
-  w: { prop: "--mvk-panel-w", key: "mvk:panelWidth", min: 380 },
-  h: { prop: "--mvk-panel-h", key: "mvk:panelHeight", min: 300 },
-};
+const MIN = { w: 380, h: 300 };
 const HANDLES = [
   { cls: "mvk-resize-x", axes: ["w"], title: "Drag to change the width, double-click to reset" },
   { cls: "mvk-resize-y", axes: ["h"], title: "Drag to change the height, double-click to reset" },
   { cls: "mvk-resize-xy", axes: ["w", "h"], title: "Drag to resize, double-click to reset" },
 ];
-
-function setSize(axis, px) {
-  const style = document.documentElement.style;
-  if (px) style.setProperty(AXES[axis].prop, `${Math.round(px)}px`);
-  else style.removeProperty(AXES[axis].prop);
-}
-
-function store(axis, px) {
-  try {
-    if (px) localStorage.setItem(AXES[axis].key, String(Math.round(px)));
-    else localStorage.removeItem(AXES[axis].key);
-  } catch (e) { /* storage blocked */ }
-}
 
 export default function ({ data, parentElement }) {
   const host = parentElement.host || parentElement;
@@ -33,9 +17,28 @@ export default function ({ data, parentElement }) {
   if (!panel) return;
   const item = panel.parentElement;          // flex item that holds the panel
   const layout = item.parentElement;          // horizontal container (wraps)
+  const name = data.name;
+  const storageKey = (axis) => `mvk:${name}${axis === "w" ? "Width" : "Height"}`;
 
-  for (const axis of Object.keys(AXES)) {
-    try { const px = parseFloat(localStorage.getItem(AXES[axis].key)); if (px > 0) setSize(axis, px); } catch (e) { /* blocked */ }
+  function setSize(axis, px) {
+    const style = document.documentElement.style;
+    if (px) style.setProperty(`--mvk-${name}-${axis}`, `${Math.round(px)}px`);
+    else style.removeProperty(`--mvk-${name}-${axis}`);
+    if (axis === "w") {                       // a set width stops the panel from growing into free space
+      if (px) style.setProperty(`--mvk-${name}-grow`, "0");
+      else style.removeProperty(`--mvk-${name}-grow`);
+    }
+  }
+
+  function store(axis, px) {
+    try {
+      if (px) localStorage.setItem(storageKey(axis), String(Math.round(px)));
+      else localStorage.removeItem(storageKey(axis));
+    } catch (e) { /* storage blocked */ }
+  }
+
+  for (const axis of ["w", "h"]) {
+    try { const px = parseFloat(localStorage.getItem(storageKey(axis))); if (px > 0) setSize(axis, px); } catch (e) { /* blocked */ }
   }
   const accent = getComputedStyle(host).getPropertyValue("--st-primary-color").trim();
   const cleanups = [];
@@ -63,9 +66,9 @@ export default function ({ data, parentElement }) {
     const onMove = (e) => {
       if (!drag) return;
       if (spec.axes.includes("w")) {
-        setSize("w", Math.max(Math.min(AXES.w.min, drag.maxW), Math.min(drag.maxW, drag.w + e.clientX - drag.x)));
+        setSize("w", Math.max(Math.min(MIN.w, drag.maxW), Math.min(drag.maxW, drag.w + e.clientX - drag.x)));
       }
-      if (spec.axes.includes("h")) setSize("h", Math.max(AXES.h.min, drag.h + e.clientY - drag.y));
+      if (spec.axes.includes("h")) setSize("h", Math.max(MIN.h, drag.h + e.clientY - drag.y));
     };
     const onUp = () => {
       if (!drag) return;
