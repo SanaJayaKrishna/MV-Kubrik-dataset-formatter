@@ -9,7 +9,7 @@ Start with ~/mvkubric_app/run.sh and open http://localhost:8501.
 
 Files: serve.py (entry point, mounts the image routes), previews.py (dataset
 index and preview images), viewer.js / viewer.css (the grid, runs in the browser),
-resizer.js (drag handle that resizes the viewer panel).
+resizer.js (drag handles that resize the viewer panel).
 Later phases will add the conversion to MV-Kubric
 (see ~/docker/isaac-sim/workspace/convert_to_mvkubric.py).
 """
@@ -201,9 +201,10 @@ def controls_help() -> None:
         "- **Step:** click ‹ or › or press the Left / Right arrow key. Hold it to keep stepping "
         "(about 30 frames per second); add Shift to step 10 frames.\n"
         "- **Jump:** type a frame number in the box and press Enter.\n"
-        "- **Arrange views:** press the right mouse button on a view, drag it onto another tile "
+        "- **Arrange views:** press the left mouse button on a view, drag it onto another tile "
         "and release; the two swap places. The arrangement is remembered per dataset folder.\n"
-        "- **Resize:** drag the handle on the viewer's right edge; double-click it to reset. "
+        "- **Resize the viewer:** drag its right edge for the width, its bottom edge for the height, "
+        "or the corner for both; the grid scales to fit. Double-click a handle to reset. "
         "This panel moves beside or below the viewer to fit.")
     st.caption("MV-Kubric conversion will be added here in a later phase.")
 
@@ -217,28 +218,34 @@ CSS = """
 /* Keep the grid fully visible during reruns (no fade-out). */
 [data-testid="stElementContainer"][data-stale="true"] { opacity: 1 !important; transition: none !important; }
 
-/* Viewer panel + side panel: the viewer's width is set by dragging its edge (resizer.js
-   stores it in --mvk-panel-w); the side panel sits beside it when it fits, else wraps below. */
+/* Viewer panel + side panel: the viewer's size is set by dragging its edges (resizer.js keeps
+   it in --mvk-panel-w / --mvk-panel-h); the side panel sits beside it when it fits, else below. */
 .st-key-mvk_layout { align-items: flex-start; }
 .st-key-mvk_layout > [data-testid="stLayoutWrapper"]:has(> .st-key-mvk_panel) {
   flex: 0 0 auto; width: var(--mvk-panel-w, 70%); min-width: min(380px, 100%); max-width: 100%;
-  position: relative;
+  height: var(--mvk-panel-h, auto); position: relative;
 }
+.st-key-mvk_panel { min-height: 0; overflow: auto; }
 .st-key-mvk_layout > [data-testid="stLayoutWrapper"]:has(> .st-key-mvk_side) { flex: 1 1 300px; min-width: 280px; }
 .st-key-panel_resizer { display: none; }
 .st-key-mvk_controls .st-key-folder { flex: 1 1 320px !important; min-width: 220px; }
-.mvk-resize-handle {
-  position: absolute; top: 0; bottom: 0; right: -14px; width: 12px; z-index: 10;
-  display: flex; align-items: center; justify-content: center; cursor: col-resize; touch-action: none;
-}
-.mvk-resize-handle::after {
-  content: ""; width: 4px; height: 56px; border-radius: 2px;
-  background: rgba(128, 128, 128, 0.45); transition: background 0.15s, height 0.15s;
-}
-.mvk-resize-handle:hover::after, .mvk-resize-handle.mvk-active::after {
-  background: var(--mvk-accent, #ff4b4b); height: 120px;
-}
-body.mvk-resizing, body.mvk-resizing * { cursor: col-resize !important; user-select: none !important; }
+.mvk-resize { position: absolute; z-index: 10; display: flex; align-items: center; justify-content: center; touch-action: none; }
+.mvk-resize-x { top: 0; bottom: 0; right: -14px; width: 12px; cursor: col-resize; }
+.mvk-resize-y { left: 0; right: 0; bottom: -14px; height: 12px; cursor: row-resize; }
+.mvk-resize-xy { right: -18px; bottom: -18px; width: 18px; height: 18px; cursor: nwse-resize; }
+.mvk-resize::after { content: ""; border-radius: 2px; background: rgba(128, 128, 128, 0.45);
+  transition: background 0.15s, width 0.15s, height 0.15s, border-color 0.15s; }
+.mvk-resize-x::after { width: 4px; height: 56px; }
+.mvk-resize-y::after { width: 56px; height: 4px; }
+.mvk-resize-xy::after { width: 9px; height: 9px; background: none; border-radius: 0 0 3px 0;
+  border-right: 3px solid rgba(128, 128, 128, 0.6); border-bottom: 3px solid rgba(128, 128, 128, 0.6); }
+.mvk-resize-x:hover::after, .mvk-resize-x.mvk-active::after { background: var(--mvk-accent, #ff4b4b); height: 120px; }
+.mvk-resize-y:hover::after, .mvk-resize-y.mvk-active::after { background: var(--mvk-accent, #ff4b4b); width: 120px; }
+.mvk-resize-xy:hover::after, .mvk-resize-xy.mvk-active::after { border-color: var(--mvk-accent, #ff4b4b); }
+body.mvk-resizing, body.mvk-resizing * { user-select: none !important; }
+body.mvk-resize-x-active * { cursor: col-resize !important; }
+body.mvk-resize-y-active * { cursor: row-resize !important; }
+body.mvk-resize-xy-active * { cursor: nwse-resize !important; }
 </style>
 """
 

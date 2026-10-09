@@ -8,7 +8,7 @@
 // Mouse and keys:
 //   < > buttons, Left/Right keys    step one frame; hold to keep stepping (Shift: 10)
 //   frame box + Enter               jump to the nearest existing frame
-//   right-button drag on a view     drop it on another tile to swap the two
+//   left-button drag on a view      drop it on another tile to swap the two
 
 const AHEAD = 12;             // frames preloaded by the browser in the direction of travel
 const BEHIND = 4;             // ...and behind
@@ -19,6 +19,7 @@ const POOL_MAX = 800;         // preloaded images kept alive (about 90 KB each)
 const SYNC_DELAY_MS = 400;    // report the frame to Python once navigation pauses
 const HOLD_DELAY_MS = 350;    // press and hold: repeating starts after this...
 const HOLD_INTERVAL_MS = 33;  // ...then about 30 steps per second, each shown before the next
+const DRAG_THRESHOLD_PX = 6;  // a press on a view becomes a drag after moving this far
 
 const savedFrame = new Map(); // dataset folder -> current frame number (survives reruns)
 const savedSlots = new Map(); // dataset folder -> tile arrangement as view names (null = empty tile)
@@ -200,7 +201,9 @@ function buildViewer(root, data) {
     shownSeq: 0,            // request number of the frame on screen
     last: null,             // what is on screen: {frame, urls: Map(view -> url|null), ok: Map(view -> bool)}
     hold: null,             // press-and-hold state
-    drag: null,             // right-button drag state
+    press: null,            // left button down on a view, not yet moved far enough to drag
+    drag: null,             // drag state while rearranging tiles
+    observer: null,         // ResizeObserver that refits the grid to the panel height
     setStateValue: null,
     syncTimer: 0,
     warmBusy: false,
@@ -384,9 +387,7 @@ function buildViewer(root, data) {
   input.addEventListener("change", jumpToInput);   // spinner arrows, or leaving the box after typing
   input.addEventListener("blur", () => updateNav());
 
-  // ---- right-button drag: rearrange the tiles
-
-  grid.addEventListener("contextmenu", (e) => e.preventDefault());
+  // ---- left-button drag: rearrange the tiles
 
   function tileAt(x, y) {
     return tiles.findIndex(({ fig }) => {
@@ -395,10 +396,25 @@ function buildViewer(root, data) {
     });
   }
 
-  function moveDrag(e) {
+  function startDrag(t, x, y) {
+    const tile = tiles[t];
+    const r = tile.fig.getBoundingClientRect();
+    const scale = Math.min(1, 260 / r.width);
+    const ghost = el("div", "mvk-ghost", root);
+    ghost.style.width = `${r.width * scale}px`;
+    const thumb = el("div", "mvk-ghost-frame", ghost);
+    thumb.style.aspectRatio = `${imgW} / ${imgH}`;
+    if (!tile.img.hidden) { const gi = el("img", "", thumb); gi.src = tile.img.src; gi.draggable = false; }
+    el("div", "mvk-ghost-label", ghost).textContent = data.views[slots[t]];
+    v.drag = { from: t, over: -1, ghost, dx: (x - r.left) * scale, dy: (y - r.top) * scale };
+    tile.fig.classList.add("mvk-drag-source");
+    grid.classList.add("mvk-dragging");
+  }
+
+  function moveDrag(x, y) {
     const d = v.drag;
-    d.ghost.style.transform = `translate(${e.clientX - d.dx}px, ${e.clientY - d.dy}px)`;
-    const over = tileAt(e.clientX, e.clientY);
+    d.ghost.style.transform = `translate(${x - d.dx}px, ${y - d.dy}px)`;
+    const over = tileAt(x, y);
     if (over === d.over) return;
     if (d.over >= 0) tiles[d.over].fig.classList.remove("mvk-drop-target");
     d.over = over;
@@ -406,10 +422,12 @@ function buildViewer(root, data) {
   }
 
   v.endDrag = (commit) => {
+    v.press = null;
     const d = v.drag;
     if (!d) return;
     v.drag = null;
     d.ghost.remove();
+    grid.classList.remove("mvk-dragging");
     tiles[d.from].fig.classList.remove("mvk-drag-source");
     if (d.over >= 0) tiles[d.over].fig.classList.remove("mvk-drop-target");
     if (!commit || d.over < 0 || d.over === d.from) return;
@@ -424,25 +442,64 @@ function buildViewer(root, data) {
 
   tiles.forEach((tile, t) => {
     tile.fig.addEventListener("pointerdown", (e) => {
-      if (e.button !== 2 || slots[t] < 0 || v.drag) return;
-      e.preventDefault();
+      if (e.button !== 0 || slots[t] < 0 || v.drag) return;
+      e.preventDefault();                  // no text selection or native image drag
       tile.fig.setPointerCapture(e.pointerId);
-      const r = tile.fig.getBoundingClientRect();
-      const scale = Math.min(1, 260 / r.width);
-      const ghost = el("div", "mvk-ghost", root);
-      ghost.style.width = `${r.width * scale}px`;
-      const thumb = el("div", "mvk-ghost-frame", ghost);
-      thumb.style.aspectRatio = `${imgW} / ${imgH}`;
-      if (!tile.img.hidden) { const gi = el("img", "", thumb); gi.src = tile.img.src; gi.draggable = false; }
-      el("div", "mvk-ghost-label", ghost).textContent = data.views[slots[t]];
-      v.drag = { from: t, over: -1, ghost, dx: (e.clientX - r.left) * scale, dy: (e.clientY - r.top) * scale };
-      tile.fig.classList.add("mvk-drag-source");
-      moveDrag(e);
+      v.press = { tile: t, x: e.clientX, y: e.clientY };
     });
-    tile.fig.addEventListener("pointermove", (e) => { if (v.drag) moveDrag(e); });
-    tile.fig.addEventListener("pointerup", (e) => { if (v.drag && e.button === 2) v.endDrag(true); });
+    tile.fig.addEventListener("pointermove", (e) => {
+      const p = v.press;
+      if (p && !v.drag) {
+        if (Math.hypot(e.clientX - p.x, e.clientY - p.y) < DRAG_THRESHOLD_PX) return;
+        startDrag(p.tile, p.x, p.y);
+      }
+      if (v.drag) moveDrag(e.clientX, e.clientY);
+    });
+    tile.fig.addEventListener("pointerup", (e) => { if (e.button === 0) v.endDrag(true); });
     tile.fig.addEventListener("pointercancel", () => v.endDrag(false));
   });
+
+  // ---- fit the grid into the panel when the panel has a fixed height (bottom/corner handle)
+
+  function fit() {
+    const panel = v.panel;
+    const fixed = panel && getComputedStyle(document.documentElement).getPropertyValue("--mvk-panel-h").trim();
+    if (!fixed || !root.isConnected) {
+      if (grid.style.width) grid.style.width = "";
+      return;
+    }
+    const ps = getComputedStyle(panel);
+    const bottom = panel.getBoundingClientRect().bottom - parseFloat(ps.paddingBottom) - parseFloat(ps.borderBottomWidth);
+    const navSpace = nav.getBoundingClientRect().height + parseFloat(getComputedStyle(nav).marginTop);
+    const gs = getComputedStyle(grid);
+    const rowGap = parseFloat(gs.rowGap) || 0;
+    const colGap = parseFloat(gs.columnGap) || 0;
+    const cap = tiles[0].cap;
+    const capSpace = cap.getBoundingClientRect().height + parseFloat(getComputedStyle(cap).marginTop);
+    const rows = Math.ceil(data.cells / data.cols);
+    const room = bottom - grid.getBoundingClientRect().top - navSpace - 4;
+    const tileH = (room - (rows - 1) * rowGap) / rows - capSpace;
+    const width = Math.max(data.cols * 48, data.cols * (tileH * imgW) / imgH + (data.cols - 1) * colGap);
+    const next = width < root.getBoundingClientRect().width ? `${Math.floor(width)}px` : "";
+    if (grid.style.width !== next) grid.style.width = next;
+  }
+
+  let fitQueued = false;
+  v.queueFit = () => {
+    if (fitQueued) return;
+    fitQueued = true;
+    requestAnimationFrame(() => { fitQueued = false; fit(); });
+  };
+  const host = root.getRootNode().host;
+  v.panel = host ? host.closest(".st-key-mvk_panel") : null;
+  v.observer = new ResizeObserver(v.queueFit);
+  if (v.panel) v.observer.observe(v.panel);
+  v.observer.observe(root);
+  v.destroy = () => {
+    v.stopHold();
+    v.endDrag(false);
+    v.observer.disconnect();
+  };
 
   paint();
   go(v.idx, 1);
@@ -462,7 +519,7 @@ export default function (component) {
   if (!root) root = el("div", "mvk-root", parentElement);
   const config = JSON.stringify(data);
   if (!root.__viewer || root.__config !== config) {
-    if (root.__viewer) { root.__viewer.stopHold(); root.__viewer.endDrag(false); }
+    if (root.__viewer) root.__viewer.destroy();
     root.__viewer = buildViewer(root, data);
     root.__config = config;
   }

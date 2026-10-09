@@ -3,7 +3,7 @@
   font-family: var(--st-font, "Source Sans Pro", sans-serif);
   color: var(--st-text-color, #31333f);
 }
-.mvk-grid { display: grid; gap: 0.6rem 0.75rem; }
+.mvk-grid { display: grid; gap: 0.6rem 0.75rem; margin: 0 auto; }
 .mvk-cell { margin: 0; min-width: 0; }
 .mvk-frame {
   position: relative;
@@ -81,7 +81,7 @@
 }
 .mvk-status.mvk-loading::after { content: "  · loading"; }
 
-/* Tile arrangement: right-button drag. */
+/* Tile arrangement: left-button drag. */
 .mvk-cell { border-radius: var(--st-base-radius, 0.5rem); transition: opacity 0.12s; }
 .mvk-empty .mvk-frame {
   background: transparent;
@@ -110,3 +110,5 @@
 .mvk-ghost-frame img { display: block; width: 100%; height: 100%; }
 .mvk-ghost-label { padding: 0.2rem 0.5rem; font-size: 0.8rem; text-align: center; color: var(--st-text-color, #31333f); }
 .mvk-grid { user-select: none; }
+.mvk-cell:not(.mvk-empty) .mvk-frame { cursor: grab; }
+.mvk-dragging, .mvk-dragging .mvk-frame { cursor: grabbing !important; }
