@@ -116,14 +116,15 @@ function storageSet(key, value) {
 }
 
 // Height available to `content` inside a panel whose height was fixed with the bottom or
-// corner handle (everything of `root` below `content` must still fit), or null when the
-// panel height is not fixed.
+// corner handle (everything below `content` in the panel, such as the controls under the
+// grid or a button under the component, must still fit), or null when it is not fixed.
 function roomForContent(panel, heightVar, root, content) {
   if (!panel || !root.isConnected) return null;
   if (!getComputedStyle(document.documentElement).getPropertyValue(heightVar).trim()) return null;
   const ps = getComputedStyle(panel);
   const bottom = panel.getBoundingClientRect().bottom - parseFloat(ps.paddingBottom) - parseFloat(ps.borderBottomWidth);
   const box = content.getBoundingClientRect();
-  const below = root.getBoundingClientRect().bottom - box.bottom;
-  return bottom - box.top - below - 4;
+  let end = root.getBoundingClientRect().bottom;
+  for (const child of panel.children) end = Math.max(end, child.getBoundingClientRect().bottom);
+  return bottom - box.top - (end - box.bottom) - 4;
 }

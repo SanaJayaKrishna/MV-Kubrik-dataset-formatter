@@ -8,7 +8,8 @@ shows the same frame of every view in an m x n grid and steps all views together
 Start with ~/mvkubric_app/run.sh and open http://localhost:8501.
 
 Files: serve.py (entry point, mounts the image routes), previews.py (dataset
-index and preview images), viewer.js / viewer.css (the grid, runs in the browser),
+index and preview images), groundtruth.py (3D boxes and cameras for the overlay),
+frame_decoder.py (PNG decoding in worker processes), viewer.js / viewer.css (the grid, runs in the browser),
 preview.js / preview.css (the preview player), common.js (browser code shared by
 both), resizer.js (drag handles that resize the viewer and preview panes).
 Later phases will add the conversion to MV-Kubric
@@ -23,11 +24,15 @@ from pathlib import Path
 
 import streamlit as st
 
+import groundtruth as gtm
 import previews as pv
 
 DEFAULT_FOLDER = "/home/jk/docker/isaac-sim/workspace/dataset_test"
 MAX_GRID = 10   # upper limit for rows and for columns
 SOURCE_FPS = 30  # capture rate of the recordings (Isaac Sim stage timeCodesPerSecond)
+# Overlay colours of tracked objects (by object index), bright enough for the warehouse scenes.
+TRACK_COLORS = ["#ff3b30", "#34c759", "#0a84ff", "#ffcc00", "#bf5af2", "#ff9f0a",
+                "#64d2ff", "#ff375f", "#30d158", "#ac8e68"]
 HERE = Path(__file__).resolve().parent
 
 
@@ -222,6 +227,35 @@ def preview_data(ds: pv.Dataset, request: dict) -> dict:
     }
 
 
+def ground_truth_controls(ds: pv.Dataset) -> dict:
+    """Top of the preview pane: overlay checkbox and object picker. Returns the overlay settings."""
+    row = st.container(horizontal=True, vertical_alignment="center")
+    on = row.checkbox("Ground truth values", key="gt_on",
+                      help="Draw a point cloud on the ground-truth 3D box of each selected object, "
+                           "with each point's trajectory over the last second, in every view.")
+    truth = None
+    key = f"gt_objects::{ds.root}"
+    if on or gtm.is_loaded(ds) or st.session_state.get(key):   # read the boxes once first wanted
+        with st.spinner("Reading ground truth..."):
+            truth = gtm.get(ds)
+    objects = {o.path: (i, o) for i, o in enumerate(truth.objects)} if truth else {}
+    chosen = row.multiselect(
+        "Objects to track", list(objects), key=key,
+        format_func=lambda path: objects[path][1].name, label_visibility="collapsed",
+        disabled=not (on and objects),
+        placeholder=("Choose objects to track" if objects or not on
+                     else "No labelled objects (bounding_box_3d) in this recording"))
+    if on and objects and not chosen:
+        st.caption("Choose one or more objects to show their tracked points.")
+    return {
+        "on": bool(on),
+        "trail": SOURCE_FPS,     # trajectory length in recorded frames (one second)
+        "objects": [{"id": objects[path][0], "name": objects[path][1].label,
+                     "color": TRACK_COLORS[objects[path][0] % len(TRACK_COLORS)]}
+                    for path in chosen if path in objects],
+    }
+
+
 @st.fragment
 def preview_pane(ds: pv.Dataset, request: dict) -> None:
     # The player reports its FPS (st.session_state.player["fps"]) for later phases.
@@ -230,8 +264,13 @@ def preview_pane(ds: pv.Dataset, request: dict) -> None:
     if head.button("Close", icon=":material/close:", key="close_preview", type="tertiary"):
         st.session_state.preview = None
         st.rerun()
+    overlay = ground_truth_controls(ds)
     player = player_component(read("common.js", "preview.js"), read("viewer.css", "preview.css"))
-    player(key="player", data=preview_data(ds, request), default={"fps": SOURCE_FPS}, on_fps_change=lambda: None)
+    player(key="player", data={**preview_data(ds, request), "gt": overlay}, default={"fps": SOURCE_FPS},
+           on_fps_change=lambda: None)
+    with st.container(horizontal=True, horizontal_alignment="center"):
+        st.button("Convert", icon=":material/output:", key="convert",
+                  help="Convert the recording to the MV-Kubric format (not active yet).")
 
 
 def dataset_info(ds: pv.Dataset) -> None:
@@ -263,7 +302,10 @@ def controls_help() -> None:
         "views as one video, starting at the current frame. Click its play button to play or pause; "
         "double-click it to stop and go back to the start frame. FPS sets how many frames are shown per "
         f"second: playback stays real time and uses evenly spaced frames of the {SOURCE_FPS} recorded "
-        "each second (15 shows every 2nd frame). The pane resizes like the viewer.")
+        "each second (15 shows every 2nd frame). The pane resizes like the viewer.\n"
+        "- **Ground truth:** in the preview pane, tick Ground truth values and choose objects. Each "
+        "object gets 26 tracked points on its ground-truth 3D box, drawn in every view with the path "
+        "of the last second.")
     st.caption("MV-Kubric conversion will be added here in a later phase.")
 
 

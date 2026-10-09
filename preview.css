@@ -25,3 +25,15 @@
   text-align: center;
   color: var(--st-gray-text-color, #808495);
 }
+.mvk-legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.3rem 0.9rem;
+  margin-top: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--st-text-color, #31333f);
+}
+.mvk-legend[hidden] { display: none; }
+.mvk-chip { display: inline-flex; align-items: center; gap: 0.35rem; }
+.mvk-dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35); }

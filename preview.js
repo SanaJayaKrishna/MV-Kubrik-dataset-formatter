@@ -8,12 +8,35 @@
 // (15 FPS -> every 2nd frame, 10 FPS -> every 3rd, 12 FPS -> frames 0, 3, 5, 8, 10, ...).
 //
 // Play button: click = play / pause, double-click = stop and go back to the start frame.
+//
+// Ground truth overlay (data.gt, set by the checkbox and object picker in app.py): for each
+// selected object a point cloud of 26 points on its ground-truth 3D box (8 corners, 12 edge
+// midpoints, 6 face centres) is projected into every view, with each point's trajectory over
+// the last `gt.trail` recorded frames. Box and camera data come from groundtruth.py.
 
 const GAP = 8;                // canvas pixels between tiles
 const PRELOAD_SECONDS = 1.5;  // browser preloads this much of the upcoming playback
 const WARM_SECONDS = 4;       // the server decodes this much ahead (at most 128 frames)
 
 const savedFps = new Map();   // dataset folder -> playback FPS
+const jsonCache = new Map();  // url -> Promise<object | null>
+
+// Weights of the 8 box corners (corner c: x = bit 0, y = bit 1, z = bit 2) for the 3x3x3
+// lattice on the box surface. The box -> world map is affine, so these give exact points.
+const LATTICE = [];
+for (const z of [0, 0.5, 1]) for (const y of [0, 0.5, 1]) for (const x of [0, 0.5, 1]) {
+  if (x === 0.5 && y === 0.5 && z === 0.5) continue;      // centre: inside, not on the surface
+  LATTICE.push([0, 1, 2, 3, 4, 5, 6, 7].map((c) =>
+    (c & 1 ? x : 1 - x) * (c & 2 ? y : 1 - y) * (c & 4 ? z : 1 - z)));
+}
+const NP = LATTICE.length;    // 26 points per object
+
+function fetchJson(url) {
+  if (!jsonCache.has(url)) {
+    jsonCache.set(url, fetch(url).then((r) => (r.ok ? r.json() : null)).catch(() => null));
+  }
+  return jsonCache.get(url);
+}
 
 const PLAY_ICON = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M8 5v14l11-7z" fill="currentColor"/></svg>';
 const PAUSE_ICON = '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M7 5h4v14H7zM13 5h4v14h-4z" fill="currentColor"/></svg>';
@@ -32,8 +55,10 @@ function buildPlayer(root, data) {
   const src = data.srcFps;
   const cols = data.cols;
   const rows = Math.ceil(data.tiles.length / cols);
-  const tileW = data.w;
-  const tileH = Math.round((data.w * imgH) / imgW);
+  // Canvas pixels per tile: the on-screen size (x device pixel ratio), at most the preview
+  // resolution; resizeCanvas() updates them when the pane changes size.
+  let tileW = data.w;
+  let tileH = Math.round((data.w * imgH) / imgW);
   const shownViews = data.tiles.filter((view) => view >= 0);
 
   const stage = el("div", "mvk-stage", root);          // canvas + view labels on top of it
@@ -41,16 +66,40 @@ function buildPlayer(root, data) {
   canvas.width = cols * tileW + (cols - 1) * GAP;
   canvas.height = rows * tileH + (rows - 1) * GAP;
   const ctx = canvas.getContext("2d");
-  data.tiles.forEach((view, t) => {   // HTML labels stay readable however small the video is drawn
-    if (view < 0) return;
-    const x = (t % cols) * (tileW + GAP);
-    const yBottom = Math.floor(t / cols) * (tileH + GAP) + tileH;
+  const tags = data.tiles.map((view) => {   // HTML labels stay readable however small the video is drawn
+    if (view < 0) return null;
     const tag = el("div", "mvk-tile-label", stage);
     tag.textContent = data.views[view];
-    tag.style.left = `calc(${(100 * x) / canvas.width}% + 6px)`;
-    tag.style.bottom = `calc(${(100 * (canvas.height - yBottom)) / canvas.height}% + 6px)`;
+    return tag;
   });
 
+  function placeTags() {
+    tags.forEach((tag, t) => {
+      if (!tag) return;
+      const x = (t % cols) * (tileW + GAP);
+      const yBottom = Math.floor(t / cols) * (tileH + GAP) + tileH;
+      tag.style.left = `calc(${(100 * x) / canvas.width}% + 6px)`;
+      tag.style.bottom = `calc(${(100 * (canvas.height - yBottom)) / canvas.height}% + 6px)`;
+    });
+  }
+
+  function resizeCanvas() {   // match the canvas to its size on screen; redraw if it changed
+    const shown = stage.getBoundingClientRect().width;
+    if (!shown) return;
+    const scale = window.devicePixelRatio || 1;
+    const w = Math.max(64, Math.min(data.w, Math.round((shown * scale - (cols - 1) * GAP) / cols)));
+    if (w === tileW) return;
+    tileW = w;
+    tileH = Math.round((w * imgH) / imgW);
+    canvas.width = cols * tileW + (cols - 1) * GAP;
+    canvas.height = rows * tileH + (rows - 1) * GAP;
+    placeTags();
+    if (p.shown !== null) draw(p.shown);
+  }
+  placeTags();
+
+  const legend = el("div", "mvk-legend", root);
+  legend.hidden = true;
   const bar = el("div", "mvk-nav", root);
   const play = el("button", "mvk-btn mvk-play", bar);
   play.title = "Click: play / pause.  Double-click: stop and go back to the start frame";
@@ -88,8 +137,13 @@ function buildPlayer(root, data) {
     setStateValue: null,
     syncTimer: 0,
     observer: null,
+    gt: { on: false, objects: [], trail: src },   // overlay settings from app.py
+    cams: null,             // per view: [[first frame, world->clip matrix], ...]
+    tracks: new Map(),      // object id -> undefined (not requested), null (loading), {pts} or {failed}
+    stats: { draws: 0, drawMs: 0, overlayMs: 0, waits: 0 },   // for diagnosing playback speed
   };
   const warm = makeWarmer();
+  const tlIndex = new Map(timeline.map((f, i) => [f, i]));
 
   const url = (view, frame) => `${data.base}/preview/${data.ds}/${view}/${frame}?w=${data.w}`;
   const urlsFor = (frame) => data.tiles.map((view) =>
@@ -109,6 +163,7 @@ function buildPlayer(root, data) {
   }
 
   function draw(frame) {    // all tiles of one recorded frame, in a single canvas update
+    const started = performance.now();
     const urls = urlsFor(frame);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     data.tiles.forEach((view, t) => {
@@ -128,9 +183,137 @@ function buildPlayer(root, data) {
         ctx.fillText(urls[t] ? `cannot load frame ${frame}` : `no frame ${frame}`, x + tileW / 2, y + tileH / 2);
       }
     });
+    const overlayStart = performance.now();
+    drawOverlay(frame);
     p.shown = frame;
     updateStatus();
+    const now = performance.now();
+    p.stats.draws++;
+    p.stats.drawMs += now - started;
+    p.stats.overlayMs += now - overlayStart;
   }
+
+  // ---- ground-truth overlay
+
+  function prepareTrack(t) {   // world positions of the 26 points in every timeline frame (NaN = unknown)
+    const pts = new Float32Array(timeline.length * NP * 3).fill(NaN);
+    t.frames.forEach((frame, j) => {
+      const ti = tlIndex.get(frame);
+      if (ti === undefined) return;
+      const c = t.corners[j];
+      LATTICE.forEach((w, k) => {
+        let x = 0, y = 0, z = 0;
+        for (let q = 0; q < 8; q++) { x += w[q] * c[3 * q]; y += w[q] * c[3 * q + 1]; z += w[q] * c[3 * q + 2]; }
+        const o = (ti * NP + k) * 3;
+        pts[o] = x; pts[o + 1] = y; pts[o + 2] = z;
+      });
+    });
+    return { pts };
+  }
+
+  function cameraAt(cams, frame) {
+    for (let i = cams.length - 1; i > 0; i--) if (cams[i][0] <= frame) return cams[i][1];
+    return cams[0][1];
+  }
+
+  // Canvas position of point o of `pts` seen by camera matrix m in the tile at (x0, y0), or null.
+  function project(m, pts, o, x0, y0) {
+    const x = pts[o];
+    if (Number.isNaN(x)) return null;
+    const y = pts[o + 1], z = pts[o + 2];
+    const w = x * m[3] + y * m[7] + z * m[11] + m[15];
+    if (w <= 1e-6) return null;                         // behind the camera
+    const u = (x * m[0] + y * m[4] + z * m[8] + m[12]) / w;
+    const v = (x * m[1] + y * m[5] + z * m[9] + m[13]) / w;
+    return [x0 + ((u + 1) / 2) * tileW, y0 + ((1 - v) / 2) * tileH];
+  }
+
+  function drawOverlay(frame) {
+    if (!p.gt.on || !p.cams || !p.gt.objects.length) return;
+    const ti = tlIndex.get(frame);
+    if (ti === undefined) return;
+    const k = canvas.width / Math.max(1, canvas.getBoundingClientRect().width);   // canvas px per screen px
+    const first = Math.max(0, ti - p.gt.trail);
+    data.tiles.forEach((view, t) => {
+      const cams = view >= 0 && p.cams[view];
+      if (!cams || !cams.length) return;
+      const x0 = (t % cols) * (tileW + GAP);
+      const y0 = Math.floor(t / cols) * (tileH + GAP);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(x0, y0, tileW, tileH);
+      ctx.clip();
+      for (const obj of p.gt.objects) {
+        const track = p.tracks.get(obj.id);
+        if (!track || !track.pts) continue;
+        ctx.beginPath();                                 // trajectories over the last second
+        for (let q = 0; q < NP; q++) {
+          let pen = false;
+          for (let i = first; i <= ti; i++) {
+            const s = project(cameraAt(cams, timeline[i]), track.pts, (i * NP + q) * 3, x0, y0);
+            if (!s) { pen = false; continue; }
+            if (pen) ctx.lineTo(s[0], s[1]); else ctx.moveTo(s[0], s[1]);
+            pen = true;
+          }
+        }
+        ctx.globalAlpha = 0.65;
+        ctx.strokeStyle = obj.color;
+        ctx.lineWidth = 1.5 * k;
+        ctx.lineJoin = "round";
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        const m = cameraAt(cams, frame);                 // the points now
+        const r = 2.6 * k;
+        ctx.beginPath();
+        for (let q = 0; q < NP; q++) {
+          const s = project(m, track.pts, (ti * NP + q) * 3, x0, y0);
+          if (!s) continue;
+          ctx.moveTo(s[0] + r, s[1]);
+          ctx.arc(s[0], s[1], r, 0, 2 * Math.PI);
+        }
+        ctx.fillStyle = obj.color;
+        ctx.fill();
+        ctx.lineWidth = 0.8 * k;
+        ctx.strokeStyle = "rgba(0, 0, 0, 0.75)";
+        ctx.stroke();
+      }
+      ctx.restore();
+    });
+  }
+
+  function renderLegend() {
+    legend.replaceChildren();
+    legend.hidden = !(p.gt.on && p.gt.objects.length);
+    for (const obj of p.gt.objects) {
+      const chip = el("span", "mvk-chip", legend);
+      el("span", "mvk-dot", chip).style.background = obj.color;
+      const track = p.tracks.get(obj.id);
+      chip.append(obj.name + (track === null ? "  (loading)" : track && track.failed ? "  (no data)" : ""));
+    }
+  }
+
+  function redraw() {          // paused: draw the frame on screen again with the new overlay
+    if (!p.playing && p.shown !== null) draw(p.shown);
+  }
+
+  p.setOverlay = (gt) => {
+    p.gt = gt && gt.on ? gt : { on: false, objects: [], trail: src };
+    const jobs = [];
+    if (p.gt.on && p.gt.objects.length) {
+      if (!p.cams) {
+        jobs.push(fetchJson(`${data.base}/gt/${data.ds}/cameras`).then((c) => { p.cams = c ? c.views : []; }));
+      }
+      for (const obj of p.gt.objects) {
+        if (p.tracks.get(obj.id) !== undefined) continue;
+        p.tracks.set(obj.id, null);
+        jobs.push(fetchJson(`${data.base}/gt/${data.ds}/object/${obj.id}`)
+          .then((t) => p.tracks.set(obj.id, t ? prepareTrack(t) : { failed: true })));
+      }
+    }
+    renderLegend();
+    redraw();
+    if (jobs.length) Promise.all(jobs).then(() => { renderLegend(); redraw(); });
+  };
 
   function updateStatus() {
     const f = p.shown ?? p.origin;
@@ -178,7 +361,7 @@ function buildPlayer(root, data) {
     if (now < p.nextDue) return;
     const frame = target(p.k);
     if (frame === null) { finish(); return; }
-    if (!ready(frame)) { request(frame); return; }   // wait for the images rather than skip a frame
+    if (!ready(frame)) { p.stats.waits++; request(frame); return; }   // wait for the images, never skip a frame
     draw(frame);
     p.k++;
     const interval = 1000 / p.fps;
@@ -255,10 +438,11 @@ function buildPlayer(root, data) {
   // With a fixed panel height (bottom or corner handle) the canvas scales to fit inside it.
   const panel = host ? host.closest(".st-key-mvk_preview") : null;
   const fit = () => {
+    resizeCanvas();
     const room = roomForContent(panel, "--mvk-preview-h", root, stage);
     const width = room === null ? null : Math.max(160, (room * canvas.width) / canvas.height);
     const next = width !== null && width < root.getBoundingClientRect().width ? `${Math.floor(width)}px` : "";
-    if (stage.style.width !== next) stage.style.width = next;
+    if (stage.style.width !== next) { stage.style.width = next; resizeCanvas(); }
   };
   let fitQueued = false;
   p.observer = new ResizeObserver(() => {
@@ -284,12 +468,19 @@ export default function (component) {
   if (!data || !data.runs || !data.runs.length) return;
   let root = parentElement.querySelector(".mvk-root");
   if (!root) root = el("div", "mvk-root", parentElement);
-  const config = JSON.stringify(data);
+  const { gt, ...base } = data;            // the overlay changes without restarting playback
+  const config = JSON.stringify(base);
   if (!root.__player || root.__config !== config) {
     if (root.__player) root.__player.destroy();
-    root.__player = buildPlayer(root, data);
+    root.__player = buildPlayer(root, base);
     root.__config = config;
+    root.__gt = undefined;
   }
   root.__player.setStateValue = setStateValue;
+  const gtConfig = JSON.stringify(gt || null);
+  if (root.__gt !== gtConfig) {
+    root.__gt = gtConfig;
+    root.__player.setOverlay(gt);
+  }
   // Playback stops by itself once the pane is closed (tick() checks root.isConnected).
 }

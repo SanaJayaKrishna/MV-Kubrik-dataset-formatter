@@ -77,6 +77,7 @@ class Dataset:
     timeline: tuple[int, ...]                 # sorted union of the frame numbers of all views
     image_size: tuple[int, int] | None        # (width, height) of the first image
     name_patterns: tuple[tuple[str, int, str] | None, ...]  # per view: (prefix, digits, suffix)
+    view_paths: tuple[str, ...] = ()          # view folders (parents of the rgb folders)
 
 
 def _name_pattern(per_view: dict[int, str]) -> tuple[str, int, str] | None:
@@ -112,7 +113,8 @@ def index_dataset(root: str, signature: tuple) -> Dataset:
             break
     ds_id = hashlib.sha1(f"{root}|{signature}".encode()).hexdigest()[:12]
     return Dataset(ds_id, root, tuple(views), tuple(frames), timeline, size,
-                   tuple(_name_pattern(f) for f in frames))
+                   tuple(_name_pattern(f) for f in frames),
+                   tuple(os.path.dirname(rgb) for _name, rgb, _mtime in signature))
 
 
 _registry: OrderedDict[str, Dataset] = OrderedDict()
