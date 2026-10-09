@@ -1,0 +1,13 @@
+[server]
+# Do not open a browser or ask for an e-mail on first start;
+# open the URL printed in the terminal instead.
+headless = true
+# Only this machine can reach the app (it can browse folders and show images).
+# Use  ./run.sh --server.address 0.0.0.0  to open it to the local network.
+address = "localhost"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
