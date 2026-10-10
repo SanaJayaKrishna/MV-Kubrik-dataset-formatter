@@ -352,7 +352,8 @@ def controls_help() -> None:
         "- **Ground truth:** in the preview, choose objects in Ground truth values (clear it to "
         "hide the overlay). Each object gets 48 tracked points on its real surface, taken from the "
         "recorded depth, moved with its exact pose from the Scene file above and drawn in every view "
-        "with the path of the last second.")
+        "with the path of the last second. A solid line in the same colour shows the route the object "
+        "has travelled since the start frame (the centre of its box at floor level).")
     st.caption("The Convert button in the preview will run the MV-Kubric conversion in a later phase.")
 
 

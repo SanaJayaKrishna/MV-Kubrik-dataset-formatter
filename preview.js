@@ -18,6 +18,8 @@
 // tracked points lie on its real surface (taken from the recorded depth) and move with its
 // per-frame pose (from the scene file, or from the 3D boxes); they are projected into every view
 // with each point's trajectory over the last `gt.trail` recorded frames (see groundtruth.py).
+// Each object's route (the centre of its box at floor level) is drawn as one solid line in its
+// colour, from the start frame up to the frame on screen; it grows during playback and stays.
 
 const GAP = 8;                // canvas pixels between tiles
 const PRELOAD_SECONDS = 1.5;  // browser preloads this much of the upcoming playback
@@ -31,6 +33,7 @@ preloader.limit = 6;          // while the preview plays the viewer is idle: use
 const savedFps = new Map();   // dataset folder -> playback FPS
 const savedSeconds = new Map(); // dataset folder -> clip length in seconds (null = until the end)
 const jsonCache = new Map();  // url -> Promise<object | null>
+const GT_FORMAT = 2;          // part of the ground-truth URLs: bump when the server's reply changes
 
 function fetchJson(url) {
   if (!jsonCache.has(url)) {
@@ -267,7 +270,18 @@ function buildPlayer(root, data) {
         pts[o + 2] = x * m[2] + y * m[6] + z * m[10] + m[14];
       });
     });
-    return { pts, n, source: t.source };
+    // The route: the anchor point (bottom centre of the box) in every frame.
+    const [ax, ay, az] = t.anchor || [0, 0, 0];
+    const route = new Float32Array(timeline.length * 3).fill(NaN);
+    t.frames.forEach((frame, j) => {
+      const ti = tlIndex.get(frame);
+      if (ti === undefined) return;
+      const m = t.transforms[j];
+      route[ti * 3] = ax * m[0] + ay * m[4] + az * m[8] + m[12];
+      route[ti * 3 + 1] = ax * m[1] + ay * m[5] + az * m[9] + m[13];
+      route[ti * 3 + 2] = ax * m[2] + ay * m[6] + az * m[10] + m[14];
+    });
+    return { pts, n, route, source: t.source };
   }
 
   function cameraAt(cams, frame) {
@@ -293,6 +307,7 @@ function buildPlayer(root, data) {
     if (ti === undefined) return;
     const k = canvas.width / Math.max(1, canvas.getBoundingClientRect().width);   // canvas px per screen px
     const first = Math.max(0, ti - p.gt.trail);
+    const routeStart = Math.min(ti, tlIndex.get(p.origin) ?? 0);   // routes run from the start frame
     data.tiles.forEach((view, t) => {
       const cams = view >= 0 && p.cams[view];
       if (!cams || !cams.length) return;
@@ -302,6 +317,26 @@ function buildPlayer(root, data) {
       ctx.beginPath();
       ctx.rect(x0, y0, tileW, tileH);
       ctx.clip();
+      for (const obj of p.gt.objects) {              // routes first, so the points stay on top
+        const track = p.tracks.get(obj.id);
+        if (!track || !track.route) continue;
+        ctx.beginPath();
+        let pen = false;
+        for (let i = routeStart; i <= ti; i++) {
+          const s = project(cameraAt(cams, timeline[i]), track.route, i * 3, x0, y0);
+          if (!s) { pen = false; continue; }
+          if (pen) ctx.lineTo(s[0], s[1]); else ctx.moveTo(s[0], s[1]);
+          pen = true;
+        }
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        ctx.strokeStyle = "rgba(0, 0, 0, 0.55)";       // dark edge: visible on light and dark floors
+        ctx.lineWidth = 5 * k;
+        ctx.stroke();
+        ctx.strokeStyle = obj.color;
+        ctx.lineWidth = 2.8 * k;
+        ctx.stroke();
+      }
       for (const obj of p.gt.objects) {
         const track = p.tracks.get(obj.id);
         if (!track || !track.pts) continue;
@@ -370,7 +405,7 @@ function buildPlayer(root, data) {
       for (const obj of p.gt.objects) {
         if (p.tracks.get(obj.id) !== undefined) continue;
         p.tracks.set(obj.id, null);
-        jobs.push(fetchJson(`${data.base}/gt/${data.ds}/object/${obj.id}?poses=${p.poseKey}`)
+        jobs.push(fetchJson(`${data.base}/gt/${data.ds}/object/${obj.id}?poses=${p.poseKey}&v=${GT_FORMAT}`)
           .then((t) => p.tracks.set(obj.id, t ? prepareTrack(t) : { failed: true })));
       }
     }

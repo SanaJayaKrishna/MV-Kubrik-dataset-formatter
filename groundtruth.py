@@ -444,6 +444,9 @@ async def object_endpoint(request: Request) -> Response:
         "label": obj.label,
         "source": pose.source,
         "points": np.round(points, 4).tolist(),                    # object coordinates
+        # centre of the box's bottom face: the point whose path is drawn as the object's route
+        "anchor": [round(float((obj.box_min[0] + obj.box_max[0]) / 2), 4),
+                   round(float((obj.box_min[1] + obj.box_max[1]) / 2), 4), round(float(obj.box_min[2]), 4)],
         "frames": [ds.timeline[i] for i in rows],
         "transforms": np.round(transforms[rows].reshape(len(rows), 16), 6).tolist() if rows else [],
     }, headers=HEADERS)
