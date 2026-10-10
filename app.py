@@ -245,33 +245,41 @@ def keep(key: str) -> None:
 
 
 def ground_truth_controls(ds: pv.Dataset) -> dict:
-    """Top of the preview: overlay checkbox and object picker. Returns the overlay settings."""
-    row = st.container(horizontal=True, vertical_alignment="center")
-    on = row.checkbox("Ground truth values", key=remembered("gt_on", False),
-                      help="Draw a point cloud on the ground-truth 3D box of each selected object, "
-                           "with each point's trajectory over the last second, in every view.")
-    keep("gt_on")
-    truth = None
+    """Top of the preview: one object picker. Choosing objects turns the ground-truth overlay on,
+    an empty picker turns it off. Returns the overlay settings."""
+    with st.spinner("Reading ground truth..."):    # once per dataset (cached), lists the objects
+        truth = gtm.get(ds)
+    objects = {o.path: (i, o) for i, o in enumerate(truth.objects)}
     key = remembered(f"gt_objects::{ds.root}", [])
-    if on or gtm.is_loaded(ds) or st.session_state.get(key):   # read the boxes once first wanted
-        with st.spinner("Reading ground truth..."):
-            truth = gtm.get(ds)
-    objects = {o.path: (i, o) for i, o in enumerate(truth.objects)} if truth else {}
+    row = st.container(horizontal=True, vertical_alignment="center")
+    row.markdown("Ground truth values", width="content")
     chosen = row.multiselect(
-        "Objects to track", list(objects), key=key,
-        format_func=lambda path: objects[path][1].name, label_visibility="collapsed",
-        disabled=not (on and objects),
-        placeholder=("Choose objects to track" if objects or not on
+        "Ground truth values", list(objects), key=key, label_visibility="collapsed",
+        format_func=lambda path: objects[path][1].name, disabled=not objects,
+        placeholder=("Choose objects to show their tracked points and trajectories" if objects
                      else "No labelled objects (bounding_box_3d) in this recording"))
     keep(key)
-    if on and objects and not chosen:
-        st.caption("Choose one or more objects to show their tracked points.")
+    selected = [path for path in chosen if path in objects]
+    pose_key = None
+    if selected:
+        pose = gtm.cached_poses(ds)
+        if pose is None:
+            with st.spinner("Reading object poses..."):
+                pose = gtm.poses(ds)
+        pose_key = pose.key
+        if pose.error:
+            st.caption(f":orange[{pose.error}. Using the recorded 3D boxes instead, so objects that turn "
+                       "are tracked wrongly while they turn.]")
+        elif pose.source == "boxes":
+            st.caption(":orange[No scene file set (Dataset panel): poses come from the recorded 3D boxes, "
+                       "which keep the first frame's orientation, so points drift on objects that turn.]")
     return {
-        "on": bool(on),
+        "on": bool(selected),
+        "poseKey": pose_key,     # changes when the pose source changes, so the player reloads the points
         "trail": SOURCE_FPS,     # trajectory length in recorded frames (one second)
         "objects": [{"id": objects[path][0], "name": objects[path][1].label,
                      "color": TRACK_COLORS[objects[path][0] % len(TRACK_COLORS)]}
-                    for path in chosen if path in objects],
+                    for path in selected],
     }
 
 
@@ -280,9 +288,11 @@ def preview_body(ds: pv.Dataset, request: dict) -> None:
     """The pane's content while the Preview toggle is on (the viewer is hidden, not removed)."""
     overlay = ground_truth_controls(ds)
     player = player_component(read("common.js", "preview.js"), read("viewer.css", "preview.css"))
-    result = player(key="player", data={**preview_data(ds, request), "gt": overlay}, default={"fps": SOURCE_FPS},
-                    on_fps_change=lambda: None, on_close_change=lambda: None)
-    # The player reports its FPS (st.session_state.player["fps"]) for later phases.
+    result = player(key="player", data={**preview_data(ds, request), "gt": overlay},
+                    default={"fps": SOURCE_FPS, "seconds": None},
+                    on_fps_change=lambda: None, on_seconds_change=lambda: None, on_close_change=lambda: None)
+    # The player reports FPS and clip length (st.session_state.player["fps"] / ["seconds"], None =
+    # until the last frame) for later phases.
     if getattr(result, "close", None):   # Preview toggle switched off: back to the viewer
         st.session_state.preview = None
         st.rerun()
@@ -291,10 +301,25 @@ def preview_body(ds: pv.Dataset, request: dict) -> None:
                   help="Convert the recording to the MV-Kubric format (not active yet).")
 
 
+def scene_key(ds: pv.Dataset) -> str:
+    return f"scene::{ds.root}"
+
+
+def remember_scene(root: str, key: str) -> None:
+    gtm.remember_scene(root, clean_path(st.session_state.get(key, "")))
+
+
 def dataset_info(ds: pv.Dataset) -> None:
     w, h = ds.image_size or (0, 0)
     st.markdown("##### Dataset")
     st.caption(ds.root)
+    st.text_input("Scene file (USD)", key=scene_key(ds), on_change=remember_scene, args=(ds.root, scene_key(ds)),
+                  placeholder="the .usd file this recording was made from",
+                  help="Gives the exact object poses for the ground-truth points. The recorded 3D boxes "
+                       "keep each object's first-frame orientation, so objects that turn need this file.")
+    pose = gtm.cached_poses(ds)
+    if pose is not None and pose.source == "scene":
+        st.caption("Exact object poses come from this file.")
     st.markdown(f"**{len(ds.views)}** view{'s' if len(ds.views) != 1 else ''}  ·  "
                 f"**{len(ds.timeline)}** frames ({ds.timeline[0]} to {ds.timeline[-1]})  ·  {w}×{h} px")
     if len({len(f) for f in ds.frames}) > 1:
@@ -321,10 +346,13 @@ def controls_help() -> None:
         "off to get the viewer back as it was. Click the play button to play or pause; double-click "
         "it to stop and go back to the start frame. FPS sets how many frames are shown per second: "
         f"playback stays real time and uses evenly spaced frames of the {SOURCE_FPS} recorded each "
-        "second (15 shows every 2nd frame).\n"
-        "- **Ground truth:** in the preview, tick Ground truth values and choose objects. Each "
-        "object gets 26 tracked points on its ground-truth 3D box, drawn in every view with the path "
-        "of the last second.")
+        "second (15 shows every 2nd frame). Seconds sets the clip length: X seconds at n FPS show "
+        "n × X frames, or stop at the last recorded frame if the recording is shorter; leave it empty to "
+        "play to the end. The total number of frames is shown under the player.\n"
+        "- **Ground truth:** in the preview, choose objects in Ground truth values (clear it to "
+        "hide the overlay). Each object gets 48 tracked points on its real surface, taken from the "
+        "recorded depth, moved with its exact pose from the Scene file above and drawn in every view "
+        "with the path of the last second.")
     st.caption("The Convert button in the preview will run the MV-Kubric conversion in a later phase.")
 
 
@@ -420,6 +448,9 @@ def main() -> None:
                     controls_help()
                 return
             pv.register(ds)
+            if scene_key(ds) not in ss:            # scene file for exact object poses (side panel)
+                ss[scene_key(ds)] = gtm.remembered_scene(ds.root)
+            gtm.use_scene(ds, clean_path(ss[scene_key(ds)]))
 
             # A new dataset folder resets the grid shape to fit its number of views.
             if ss.get("loaded_root") != ds.root:

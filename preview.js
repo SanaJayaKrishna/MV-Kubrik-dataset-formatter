@@ -7,13 +7,17 @@
 // ones: output frame k shows recorded frame  start + round(k * srcFps / n)
 // (15 FPS -> every 2nd frame, 10 FPS -> every 3rd, 12 FPS -> frames 0, 3, 5, 8, 10, ...).
 //
+// Seconds (optional): length of the clip. X seconds at n FPS show n * X frames, covering X
+// seconds of the recording from the start frame; empty plays until the last frame. If the
+// recording ends sooner, playback simply stops at its last frame.
+//
 // Play button: click = play / pause, double-click = stop and go back to the start frame.
 // Preview toggle (on): switches the pane back to the multi-view viewer.
 //
-// Ground truth overlay (data.gt, set by the checkbox and object picker in app.py): for each
-// selected object a point cloud of 26 points on its ground-truth 3D box (8 corners, 12 edge
-// midpoints, 6 face centres) is projected into every view, with each point's trajectory over
-// the last `gt.trail` recorded frames. Box and camera data come from groundtruth.py.
+// Ground truth overlay (data.gt, set by the object picker in app.py): each selected object's
+// tracked points lie on its real surface (taken from the recorded depth) and move with its
+// per-frame pose (from the scene file, or from the 3D boxes); they are projected into every view
+// with each point's trajectory over the last `gt.trail` recorded frames (see groundtruth.py).
 
 const GAP = 8;                // canvas pixels between tiles
 const PRELOAD_SECONDS = 1.5;  // browser preloads this much of the upcoming playback
@@ -25,17 +29,8 @@ const PREROLL_MAX_MS = 2000;  // ...or after this long at most
 preloader.limit = 6;          // while the preview plays the viewer is idle: use every browser connection
 
 const savedFps = new Map();   // dataset folder -> playback FPS
+const savedSeconds = new Map(); // dataset folder -> clip length in seconds (null = until the end)
 const jsonCache = new Map();  // url -> Promise<object | null>
-
-// Weights of the 8 box corners (corner c: x = bit 0, y = bit 1, z = bit 2) for the 3x3x3
-// lattice on the box surface. The box -> world map is affine, so these give exact points.
-const LATTICE = [];
-for (const z of [0, 0.5, 1]) for (const y of [0, 0.5, 1]) for (const x of [0, 0.5, 1]) {
-  if (x === 0.5 && y === 0.5 && z === 0.5) continue;      // centre: inside, not on the surface
-  LATTICE.push([0, 1, 2, 3, 4, 5, 6, 7].map((c) =>
-    (c & 1 ? x : 1 - x) * (c & 2 ? y : 1 - y) * (c & 4 ? z : 1 - z)));
-}
-const NP = LATTICE.length;    // 26 points per object
 
 function fetchJson(url) {
   if (!jsonCache.has(url)) {
@@ -129,8 +124,17 @@ function buildPlayer(root, data) {
   fpsInput.max = String(src);
   fpsInput.step = "1";
   fpsInput.title = `Frames shown per second (1 to ${src}); playback stays real time`;
+  const secondsLabel = el("label", "mvk-label", bar);
+  secondsLabel.append("Seconds");
+  const secondsInput = el("input", "mvk-input mvk-seconds", secondsLabel);
+  secondsInput.type = "number";
+  secondsInput.min = "0";
+  secondsInput.step = "any";
+  secondsInput.placeholder = "all";
+  secondsInput.title = "How long to play, in seconds of the recording (empty: until the last frame)";
   const status = el("span", "mvk-status mvk-player-status", bar);
   const note = el("div", "mvk-player-note", root);
+  const clipNote = el("div", "mvk-player-note mvk-player-clip", root);
   const actions = el("div", "mvk-actions", root);
   const toggle = makeToggle(actions, "Preview", true);
   toggle.title = "Switch back to the multi-view viewer";
@@ -142,12 +146,16 @@ function buildPlayer(root, data) {
   const font = (theme && theme.getPropertyValue("--st-font").trim()) || "sans-serif";
 
   const saved = savedFps.get(data.root) ?? parseInt(storageGet(`mvk:fps:${data.root}`), 10);
+  const savedSecs = savedSeconds.has(data.root) ? savedSeconds.get(data.root)
+    : parseFloat(storageGet(`mvk:seconds:${data.root}`));
   const origin = timeline[nearestIndex(timeline, data.start)];
   const p = {
     origin,                 // start frame (from the viewer)
     anchor: origin,         // output frame k shows recorded frame anchor + round(k * src / fps)
     k: 0,                   // next output frame to show
     fps: Number.isInteger(saved) && saved >= 1 && saved <= src ? saved : src,
+    seconds: Number.isFinite(savedSecs) && savedSecs > 0 ? savedSecs : null,   // clip length; null = to the end
+    secondsTimer: 0,
     playing: false,
     ended: false,
     raf: 0,
@@ -162,7 +170,8 @@ function buildPlayer(root, data) {
     observer: null,
     gt: { on: false, objects: [], trail: src },   // overlay settings from app.py
     cams: null,             // per view: [[first frame, world->clip matrix], ...]
-    tracks: new Map(),      // object id -> undefined (not requested), null (loading), {pts} or {failed}
+    tracks: new Map(),      // object id -> undefined (not requested), null (loading), {pts, n} or {failed}
+    poseKey: null,          // pose source the tracks were loaded for
     stats: { draws: 0, drawMs: 0, overlayMs: 0, waits: 0 },   // for diagnosing playback speed
   };
   const warm = makeWarmer();
@@ -172,10 +181,32 @@ function buildPlayer(root, data) {
   const urlsFor = (frame) => data.tiles.map((view) =>
     (view >= 0 && !missing[view].has(frame) ? url(view, frame) : null));
 
-  function target(k) {      // recorded frame for output frame k, or null past the end
+  function target(k) {      // recorded frame for output frame k, or null past the end of the clip
     const f = p.anchor + Math.round((k * src) / p.fps);
-    return f > last ? null : timeline[nearestIndex(timeline, f)];
+    if (f > last || f - p.origin > clipOffset()) return null;
+    return timeline[nearestIndex(timeline, f)];
   }
+
+  // ---- clip length (Seconds field)
+
+  const ratio = () => src / p.fps;              // recorded frames per shown frame
+  // Largest offset from the start frame inside the clip: X seconds = offsets below X * src.
+  const clipOffset = () => (p.seconds ? Math.ceil(p.seconds * src - 1e-9) - 1 : Infinity);
+  // Shown frames k = 0, 1, ... whose recorded offset round(k * ratio) is at most `offset`.
+  const framesUpTo = (offset) => (offset < 0 ? 0 : Math.ceil((offset + 0.5) / ratio() - 1e-9));
+
+  function clipPlan() {
+    const available = last - p.origin;
+    const total = framesUpTo(Math.min(available, clipOffset()));
+    return {
+      total,                                                    // frames that will be shown
+      requested: p.seconds ? framesUpTo(clipOffset()) : total,  // n * X
+      cut: p.seconds !== null && clipOffset() > available,      // the recording ends first
+      lastFrame: p.origin + Math.round((total - 1) * ratio()),
+    };
+  }
+
+  const formatSeconds = (x) => String(Math.round(x * 100) / 100);
 
   function ready(frame) {
     return urlsFor(frame).every((u) => u === null || ["ok", "error"].includes(loadState(u)));
@@ -220,20 +251,23 @@ function buildPlayer(root, data) {
 
   // ---- ground-truth overlay
 
-  function prepareTrack(t) {   // world positions of the 26 points in every timeline frame (NaN = unknown)
-    const pts = new Float32Array(timeline.length * NP * 3).fill(NaN);
+  // World positions of the object's n surface points in every timeline frame (NaN = unknown):
+  // point p (object coordinates) at frame f is [p 1] @ T(f), T row-major with translation last.
+  function prepareTrack(t) {
+    const n = t.points.length;
+    const pts = new Float32Array(timeline.length * n * 3).fill(NaN);
     t.frames.forEach((frame, j) => {
       const ti = tlIndex.get(frame);
       if (ti === undefined) return;
-      const c = t.corners[j];
-      LATTICE.forEach((w, k) => {
-        let x = 0, y = 0, z = 0;
-        for (let q = 0; q < 8; q++) { x += w[q] * c[3 * q]; y += w[q] * c[3 * q + 1]; z += w[q] * c[3 * q + 2]; }
-        const o = (ti * NP + k) * 3;
-        pts[o] = x; pts[o + 1] = y; pts[o + 2] = z;
+      const m = t.transforms[j];
+      t.points.forEach(([x, y, z], q) => {
+        const o = (ti * n + q) * 3;
+        pts[o] = x * m[0] + y * m[4] + z * m[8] + m[12];
+        pts[o + 1] = x * m[1] + y * m[5] + z * m[9] + m[13];
+        pts[o + 2] = x * m[2] + y * m[6] + z * m[10] + m[14];
       });
     });
-    return { pts };
+    return { pts, n, source: t.source };
   }
 
   function cameraAt(cams, frame) {
@@ -271,11 +305,12 @@ function buildPlayer(root, data) {
       for (const obj of p.gt.objects) {
         const track = p.tracks.get(obj.id);
         if (!track || !track.pts) continue;
+        const n = track.n;
         ctx.beginPath();                                 // trajectories over the last second
-        for (let q = 0; q < NP; q++) {
+        for (let q = 0; q < n; q++) {
           let pen = false;
           for (let i = first; i <= ti; i++) {
-            const s = project(cameraAt(cams, timeline[i]), track.pts, (i * NP + q) * 3, x0, y0);
+            const s = project(cameraAt(cams, timeline[i]), track.pts, (i * n + q) * 3, x0, y0);
             if (!s) { pen = false; continue; }
             if (pen) ctx.lineTo(s[0], s[1]); else ctx.moveTo(s[0], s[1]);
             pen = true;
@@ -290,8 +325,8 @@ function buildPlayer(root, data) {
         const m = cameraAt(cams, frame);                 // the points now
         const r = 2.6 * k;
         ctx.beginPath();
-        for (let q = 0; q < NP; q++) {
-          const s = project(m, track.pts, (ti * NP + q) * 3, x0, y0);
+        for (let q = 0; q < n; q++) {
+          const s = project(m, track.pts, (ti * n + q) * 3, x0, y0);
           if (!s) continue;
           ctx.moveTo(s[0] + r, s[1]);
           ctx.arc(s[0], s[1], r, 0, 2 * Math.PI);
@@ -323,6 +358,10 @@ function buildPlayer(root, data) {
 
   p.setOverlay = (gt) => {
     p.gt = gt && gt.on ? gt : { on: false, objects: [], trail: src };
+    if (p.gt.on && p.gt.poseKey !== p.poseKey) {   // other pose source (scene file changed): reload
+      p.poseKey = p.gt.poseKey;
+      p.tracks.clear();
+    }
     const jobs = [];
     if (p.gt.on && p.gt.objects.length) {
       if (!p.cams) {
@@ -331,7 +370,7 @@ function buildPlayer(root, data) {
       for (const obj of p.gt.objects) {
         if (p.tracks.get(obj.id) !== undefined) continue;
         p.tracks.set(obj.id, null);
-        jobs.push(fetchJson(`${data.base}/gt/${data.ds}/object/${obj.id}`)
+        jobs.push(fetchJson(`${data.base}/gt/${data.ds}/object/${obj.id}?poses=${p.poseKey}`)
           .then((t) => p.tracks.set(obj.id, t ? prepareTrack(t) : { failed: true })));
       }
     }
@@ -343,7 +382,17 @@ function buildPlayer(root, data) {
   function updateStatus() {
     const f = p.shown ?? p.origin;
     const seconds = ((f - p.origin) / src).toFixed(2);
-    status.textContent = p.ended ? `frame ${f}  ·  ${seconds} s  ·  end` : `frame ${f}  ·  ${seconds} s`;
+    const plan = clipPlan();
+    const position = Math.max(1, Math.min(plan.total, Math.round((f - p.origin) / ratio()) + 1));
+    status.textContent = `frame ${f}  ·  ${seconds} s  ·  ${position} of ${plan.total}` + (p.ended ? "  ·  end" : "");
+    const range = `recorded frames ${p.origin} to ${plan.lastFrame}`;
+    const length = `${(plan.total / p.fps).toFixed(2)} s`;
+    clipNote.textContent = !p.seconds
+      ? `Plays to the last frame: ${plan.total} frames at ${p.fps} fps (${range}, ${length})`
+      : !plan.cut
+        ? `Plays ${formatSeconds(p.seconds)} s × ${p.fps} fps = ${plan.total} frames (${range})`
+        : `${formatSeconds(p.seconds)} s × ${p.fps} fps would be ${plan.requested} frames, but the recording ` +
+          `ends at frame ${last}: plays ${plan.total} frames (${range}, ${length})`;
     const pick = p.fps === src ? "every recorded frame"
       : src % p.fps === 0 ? `every ${ordinal(src / p.fps)} recorded frame`
       : `${p.fps} of every ${src} recorded frames, evenly spaced`;
@@ -467,6 +516,25 @@ function buildPlayer(root, data) {
     pause();
     p.setTriggerValue("close", true);
   });
+  function setSeconds(value) {
+    const seconds = Number.isFinite(value) && value > 0 ? Math.round(value * 100) / 100 : null;
+    secondsInput.value = seconds === null ? "" : String(seconds);
+    if (seconds === p.seconds) return;
+    p.seconds = seconds;
+    savedSeconds.set(data.root, seconds);
+    storageSet(`mvk:seconds:${data.root}`, seconds === null ? "" : String(seconds));
+    clearTimeout(p.secondsTimer);
+    p.secondsTimer = setTimeout(() => { if (p.setStateValue) p.setStateValue("seconds", seconds); }, 300);
+    updateStatus();
+    prefetch();
+  }
+
+  secondsInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); secondsInput.blur(); }
+    else if (e.key === "Escape") { secondsInput.value = p.seconds === null ? "" : String(p.seconds); secondsInput.blur(); }
+  });
+  secondsInput.addEventListener("change", () => setSeconds(parseFloat(secondsInput.value)));
+
   play.addEventListener("click", (e) => {
     if (e.detail === 2) stop();                      // second click of a double-click
     else if (e.detail <= 1) (p.playing ? pause : start)();
@@ -500,6 +568,7 @@ function buildPlayer(root, data) {
 
   p.destroy = () => { pause(); p.observer.disconnect(); };
   fpsInput.value = String(p.fps);
+  secondsInput.value = p.seconds === null ? "" : String(p.seconds);
   setIcon();
   ctx.fillStyle = tileBg;
   ctx.fillRect(0, 0, canvas.width, canvas.height);

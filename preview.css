@@ -18,7 +18,8 @@
 }
 .mvk-play { min-width: 3.5rem; }
 .mvk-fps { width: 4.5rem; }
-.mvk-player-status { min-width: 10rem; }
+.mvk-seconds { width: 5.5rem; }
+.mvk-player-status { min-width: 14rem; }
 .mvk-player-note {
   margin-top: 0.4rem;
   font-size: 0.8rem;
@@ -37,3 +38,4 @@
 .mvk-legend[hidden] { display: none; }
 .mvk-chip { display: inline-flex; align-items: center; gap: 0.35rem; }
 .mvk-dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35); }
+.mvk-player-clip { margin-top: 0.15rem; color: var(--st-text-color, #31333f); }
