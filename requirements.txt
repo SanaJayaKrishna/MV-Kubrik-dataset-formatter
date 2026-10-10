@@ -1,2 +1,5 @@
 streamlit>=1.65
 pillow
+numpy
+imageio
+imageio-ffmpeg

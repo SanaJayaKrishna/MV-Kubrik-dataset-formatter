@@ -9,7 +9,8 @@ Start with ~/mvkubric_app/run.sh and open http://localhost:8501.
 
 Files: serve.py (entry point, mounts the image routes), previews.py (dataset
 index and preview images), groundtruth.py (3D boxes and cameras for the overlay),
-frame_decoder.py (PNG decoding in worker processes), viewer.js / viewer.css (the grid, runs in the browser),
+frame_decoder.py (PNG decoding in worker processes), converter.py + jobs.py (the MV-Kubric
+conversion, run in a background process), viewer.js / viewer.css (the grid, runs in the browser),
 preview.js / preview.css (the preview player), common.js (browser code shared by
 both), resizer.js (drag handles that resize the viewer and preview panes).
 Later phases will add the conversion to MV-Kubric
@@ -20,11 +21,14 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from pathlib import Path
 
 import streamlit as st
 
+import converter as cv
 import groundtruth as gtm
+import jobs
 import previews as pv
 
 DEFAULT_FOLDER = "/home/jk/docker/isaac-sim/workspace/dataset_test"
@@ -296,9 +300,122 @@ def preview_body(ds: pv.Dataset, request: dict) -> None:
     if getattr(result, "close", None):   # Preview toggle switched off: back to the viewer
         st.session_state.preview = None
         st.rerun()
+    convert_controls(ds, request, result)
+
+
+def next_scene_name(ds: pv.Dataset) -> str:
+    folder = Path(ds.root) / cv.OUTPUT_DIR
+    try:
+        taken = [int(p.name) for p in folder.iterdir() if p.is_dir() and p.name.isdigit()]
+    except OSError:
+        taken = []
+    return str(max(taken, default=0) + 1)
+
+
+def convert_controls(ds: pv.Dataset, request: dict, result) -> None:
+    """Convert button: the clip shown in the preview (start frame, FPS, Seconds) becomes one scene."""
+    ss = st.session_state
+    fps = int(getattr(result, "fps", None) or SOURCE_FPS)
+    seconds = getattr(result, "seconds", None)
+    frames = cv.clip_frames(ds.timeline, request["frame"], fps, seconds)
+    busy = jobs.is_running(ss.get("convert_job"))
+    target = f"{ds.root}/{cv.OUTPUT_DIR}/{next_scene_name(ds)}"
     with st.container(horizontal=True, horizontal_alignment="center"):
-        st.button("Convert", icon=":material/output:", key="convert",
-                  help="Convert the recording to the MV-Kubric format (not active yet).")
+        clicked = st.button("Converting..." if busy else "Convert", icon=":material/output:", key="convert",
+                            disabled=busy or len(frames) < 2,
+                            help="Convert the clip shown above into one MV-Kubric scene. The conversion runs in "
+                                 "the background; a pane shows its progress.")
+    st.caption(f"Converts {len(frames)} frames ({frames[0]} to {frames[-1]}) at {fps} fps from {len(ds.views)} "
+               f"views into {target}" if frames else "The clip is empty.")
+    if clicked and not busy:
+        clip = {"first": frames[0], "last": frames[-1], "frames": len(frames), "fps": fps,
+                "views": len(ds.views), "target": target}
+        ss.convert_job = jobs.start(ds.root, request["frame"], fps, seconds, clean_path(ss[scene_key(ds)]), clip)
+        st.rerun()                     # the conversion pane lives outside this fragment
+
+
+# --------------------------------------------------------------------------- conversion pane
+
+STATUS_ICONS = {
+    "done": ":green[:material/check_circle:]",
+    "running": ":blue[:material/progress_activity:]",
+    "pending": ":gray[:material/radio_button_unchecked:]",
+    "failed": ":red[:material/error:]",
+    "stopped": ":orange[:material/stop_circle:]",
+}
+
+
+def overall_progress(state: dict) -> float:
+    total = sum(step["weight"] for step in state.get("steps", [])) or 1
+    done = 0.0
+    for step in state.get("steps", []):
+        if step["status"] == "done":
+            done += step["weight"]
+        elif step["status"] == "running" and step["total"]:
+            done += step["weight"] * step["done"] / step["total"]
+    return min(1.0, done / total)
+
+
+def step_line(step: dict) -> str:
+    count = f" ({step['done']}/{step['total']})" if step["status"] == "running" and step["total"] else ""
+    detail = f"  \n:gray[{step['detail']}]" if step.get("detail") else ""
+    return f"{STATUS_ICONS.get(step['status'], '')} {step['label']}{count}{detail}"
+
+
+def conversion_pane(job: dict) -> None:
+    running = jobs.is_running(job)
+    body = st.fragment(run_every=0.5 if running else None)(conversion_body)
+    body(job, running)
+
+
+def conversion_body(job: dict, was_running: bool) -> None:
+    ss = st.session_state
+    state = jobs.read(job)
+    running = state.get("status") in ("starting", "running")
+    if was_running and not running:
+        st.rerun()                     # finished: stop polling and enable Convert again
+    head = st.container(horizontal=True, vertical_alignment="center", horizontal_alignment="distribute")
+    head.markdown("##### MV-Kubric conversion")
+    if running:
+        if head.button("Stop", icon=":material/stop:", key="convert_stop", type="tertiary"):
+            jobs.stop(job)
+            st.rerun()
+    elif head.button("Close", icon=":material/close:", key="convert_close", type="tertiary"):
+        ss.convert_job = None
+        st.rerun()
+    clip = job["clip"]
+    st.caption(f"Frames {clip['first']} to {clip['last']}: {clip['frames']} frames at {clip['fps']} fps from "
+               f"{clip['views']} views  \nOutput: {state.get('output') or clip['target']}")
+    elapsed = (state.get("finished") or time.time()) - state.get("started", job["started"])
+    fraction = 1.0 if state.get("status") == "done" else overall_progress(state)
+    label = {"starting": "Starting", "running": "Converting", "done": "Done", "failed": "Failed",
+             "stopped": "Stopped"}.get(state.get("status"), "")
+    st.progress(fraction, text=f"{label}: {fraction * 100:.0f} %  ·  {int(elapsed // 60)}:{int(elapsed % 60):02d}")
+
+    steps = state.get("steps", [])
+    completed = [s for s in steps if s["status"] == "done"]
+    pending = [s for s in steps if s["status"] != "done"]
+    st.markdown(f"**Completed** ({len(completed)} of {len(steps)})")
+    st.markdown("\n".join(f"- {step_line(s)}" for s in completed) if completed else ":gray[Nothing yet]")
+    st.markdown(f"**Pending** ({len(pending)})")
+    st.markdown("\n".join(f"- {step_line(s)}" for s in pending) if pending else ":gray[Nothing left]")
+    for note in state.get("notes", []):
+        st.caption(f":orange[{note}]")
+    if state.get("not_written"):
+        st.caption("Not written, because MVTracker makes them itself: " + "; ".join(
+            f"{item['name']} ({item['reason']})" for item in state["not_written"]) + ".")
+    if state.get("status") == "done" and state.get("summary"):
+        summary = state["summary"]
+        st.success(f"Scene {summary['scene']} saved to {state['output']}: {summary['frames']} frames, "
+                   f"{summary['views']} views, {summary['tracks']} tracked points on the background and "
+                   f"{len(summary['objects'])} objects. {summary['check']}.")
+    elif state.get("status") in ("failed", "stopped"):
+        st.error(state.get("error") or "The conversion did not finish.")
+        if state.get("traceback"):
+            with st.expander("Details"):
+                st.code(state["traceback"], language=None)
+
+
 
 
 def scene_key(ds: pv.Dataset) -> str:
@@ -349,6 +466,9 @@ def controls_help() -> None:
         "second (15 shows every 2nd frame). Seconds sets the clip length: X seconds at n FPS show "
         "n × X frames, or stop at the last recorded frame if the recording is shorter; leave it empty to "
         "play to the end. The total number of frames is shown under the player.\n"
+        "- **Convert:** in the preview, Convert turns the clip shown (start frame, FPS, Seconds) into one "
+        f"MV-Kubric scene in the dataset folder's {cv.OUTPUT_DIR}/ folder (1, 2, 3, ...). A pane shows the "
+        "progress; it runs in the background, so the app stays usable.\n"
         "- **Ground truth:** in the preview, choose objects in Ground truth values (clear it to "
         "hide the overlay). Each object gets 48 tracked points on its real surface, taken from the "
         "recorded depth, moved with its exact pose from the Scene file above and drawn in every view "
@@ -376,7 +496,12 @@ CSS = """
 }
 .st-key-mvk_panel { min-height: 0; overflow: auto; }
 .st-key-mvk_layout > [data-testid="stLayoutWrapper"]:has(> .st-key-mvk_side) { flex: 1 1 300px; min-width: 280px; }
-.st-key-panel_resizer { display: none; }
+.st-key-mvk_layout > [data-testid="stLayoutWrapper"]:has(> .st-key-mvk_convert) {
+  flex-grow: var(--mvk-convert-grow, 1); flex-shrink: 0; flex-basis: var(--mvk-convert-w, 380px);
+  min-width: min(380px, 100%); max-width: 100%; height: var(--mvk-convert-h, auto); position: relative;
+}
+.st-key-mvk_convert { min-height: 0; overflow: auto; }
+.st-key-panel_resizer, .st-key-convert_resizer { display: none; }
 .st-key-mvk_controls .st-key-folder { flex: 1 1 320px !important; min-width: 220px; }
 .mvk-resize { position: absolute; z-index: 10; display: flex; align-items: center; justify-content: center; touch-action: none; }
 .mvk-resize-x { top: 0; bottom: 0; right: -14px; width: 12px; cursor: col-resize; }
@@ -425,6 +550,7 @@ def main() -> None:
     # beside it when it fits and wraps below otherwise.
     with st.container(horizontal=True, key="mvk_layout"):
         panel = st.container(border=True, key="mvk_panel")
+        convert_box = st.container(border=True, key="mvk_convert") if ss.get("convert_job") else None
         side = st.container(key="mvk_side")
 
     with panel:
@@ -469,6 +595,11 @@ def main() -> None:
 
         if preview_on:
             preview_body(ds, request)
+
+    if convert_box is not None:
+        with convert_box:
+            resizer_component(read("resizer.js"))(key="convert_resizer", data={"panel": "mvk_convert", "name": "convert"})
+            conversion_pane(ss.convert_job)
 
     with side:
         dataset_info(ds)
