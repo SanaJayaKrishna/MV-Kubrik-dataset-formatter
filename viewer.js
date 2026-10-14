@@ -133,7 +133,9 @@ function buildViewer(root, data) {
   };
   const warm = makeWarmer();
 
-  const url = (view, frame) => `${data.base}/preview/${data.ds}/${view}/${frame}?w=${data.w}`;
+  // data.views can be a subset of the dataset's cameras: viewIdx maps them to dataset view numbers
+  const datasetView = (view) => (data.viewIdx ? data.viewIdx[view] : view);
+  const url = (view, frame) => `${data.base}/preview/${data.ds}/${datasetView(view)}/${frame}?w=${data.w}`;
   const has = (view, frame) => !missing[view].has(frame);
   const visibleViews = () => slots.slice(0, data.cells).filter((view) => view >= 0);
   const fileName = (view, frame) => {
@@ -210,7 +212,8 @@ function buildViewer(root, data) {
     for (let k = 1; k <= WARM_BEHIND; k++) ranked.push([2.5 * k, i - delta * k]);
     ranked.sort((a, b) => a[0] - b[0]);
     const order = ranked.filter((r) => r[1] >= 0 && r[1] < n);
-    warm(`${data.base}/warm/${data.ds}?w=${data.w}&v=${visibleViews().join(",")}&f=${order.map((r) => timeline[r[1]]).join(",")}`);
+    warm(`${data.base}/warm/${data.ds}?w=${data.w}&v=${visibleViews().map(datasetView).join(",")}` +
+         `&f=${order.map((r) => timeline[r[1]]).join(",")}`);
     const near = order.filter((r) => r[0] <= AHEAD).map((r) => r[1]);   // the nearest steps both ways
     const views = visibleViews();
     const urls = [];

@@ -154,6 +154,26 @@ def preview_width(cols: int, image_size: tuple[int, int] | None) -> int:
 
 # --------------------------------------------------------------------------- preview cache
 
+def _workers_skip_main_module() -> None:
+    """Python starts each worker process by importing the parent's __main__ module. Inside
+    Streamlit, __main__ is the page script while a page runs, so every decoder worker would run
+    app.py once outside Streamlit (wasted start-up work and a burst of warnings). The workers only
+    need frame_decoder, which they import by name, so leave __main__ out of their start-up data."""
+    from multiprocessing import spawn
+    if getattr(spawn.get_preparation_data, "_skips_main", False):
+        return
+    original = spawn.get_preparation_data
+
+    def preparation_data(name):
+        data = original(name)
+        data.pop("init_main_from_path", None)
+        data.pop("init_main_from_name", None)
+        return data
+
+    preparation_data._skips_main = True
+    spawn.get_preparation_data = preparation_data
+
+
 class PreviewCache:
     """Thread-safe LRU cache of preview JPEGs, decoded in worker processes (see frame_decoder.py).
 
@@ -174,6 +194,7 @@ class PreviewCache:
 
     def _pools(self) -> tuple[ProcessPoolExecutor, ProcessPoolExecutor]:
         if self._now is None:
+            _workers_skip_main_module()
             cores = os.cpu_count() or 4
             options = dict(mp_context=multiprocessing.get_context("forkserver"),
                            initializer=frame_decoder.watch_server, initargs=(os.getpid(),))

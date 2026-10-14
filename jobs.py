@@ -21,7 +21,7 @@ _processes: dict[str, subprocess.Popen] = {}
 
 
 def start(dataset_root: str, start_frame: int, fps: int, seconds: float | None, scene_file: str,
-          clip: dict) -> dict:
+          clip: dict, views: list[str] | None = None) -> dict:
     """Launch a conversion; returns the job record the app keeps in its session state."""
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{len(_processes)}"
@@ -33,6 +33,8 @@ def start(dataset_root: str, start_frame: int, fps: int, seconds: float | None, 
         cmd += ["--seconds", str(seconds)]
     if scene_file:
         cmd += ["--scene-file", scene_file]
+    for view in views or []:
+        cmd += ["--view", view]
     with open(log, "w") as log_file:
         _processes[job_id] = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT,
                                               cwd=str(CONVERTER.parent))

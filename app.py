@@ -162,26 +162,39 @@ def browse_dialog() -> None:
 
 # --------------------------------------------------------------------------- viewer
 
+def camera_key(ds: pv.Dataset) -> str:
+    return f"cameras::{ds.root}"
+
+
+def chosen_cameras(ds: pv.Dataset) -> list[int]:
+    """Dataset view numbers of the cameras chosen in the Cameras picker, in the dataset's order."""
+    chosen = set(st.session_state.get(camera_key(ds)) or [])
+    return [i for i, name in enumerate(ds.views) if name in chosen]
+
+
 def missing_runs(ds: pv.Dataset) -> dict[str, list[list[int]]]:
     """Per view index: frames of the timeline that this view lacks, as runs."""
     return {str(v): pv.to_runs(f for f in ds.timeline if f not in frames)
             for v, frames in enumerate(ds.frames) if len(frames) != len(ds.timeline)}
 
 
-def viewer_data(ds: pv.Dataset, rows: int, cols: int) -> dict:
+def viewer_data(ds: pv.Dataset, rows: int, cols: int, cameras: list[int]) -> dict:
     """Everything the browser-side grid needs (frame lists are sent as compact runs).
 
-    All views are sent; the grid shows rows x cols tiles and the user arranges
-    which view goes on which tile (saved per dataset folder in the browser).
+    The chosen cameras are sent (viewIdx: their dataset view numbers, used in image URLs); the
+    grid shows rows x cols tiles and the user arranges which view goes on which tile (saved per
+    dataset folder in the browser).
     """
+    missing = missing_runs(ds)
     return {
         "ds": ds.id,
         "root": ds.root,
         "base": pv.ROUTE_PREFIX,
-        "views": list(ds.views),
-        "names": list(ds.name_patterns),
+        "views": [ds.views[i] for i in cameras],
+        "viewIdx": cameras,
+        "names": [ds.name_patterns[i] for i in cameras],
         "runs": pv.to_runs(ds.timeline),
-        "missing": missing_runs(ds),
+        "missing": {str(k): missing[str(i)] for k, i in enumerate(cameras) if str(i) in missing},
         "cols": cols,
         "cells": rows * cols,
         "w": pv.preview_width(cols, ds.image_size),
@@ -190,13 +203,13 @@ def viewer_data(ds: pv.Dataset, rows: int, cols: int) -> dict:
 
 
 @st.fragment
-def viewer(ds: pv.Dataset, rows: int, cols: int, preview_on: bool) -> None:
+def viewer(ds: pv.Dataset, rows: int, cols: int, preview_on: bool, cameras: list[int]) -> None:
     # The grid steps frames in the browser. Once navigation pauses it reports the
     # frame (st.session_state.viewer["frame"]) and, after a rearrangement, the
     # tile order as view names (st.session_state.viewer["layout"]) for later
     # phases; being a fragment, those reports rerun only this part of the page.
     grid = grid_component(read("common.js", "viewer.js"), read("viewer.css"))
-    result = grid(key="viewer", data={**viewer_data(ds, rows, cols), "previewOn": preview_on},
+    result = grid(key="viewer", data={**viewer_data(ds, rows, cols, cameras), "previewOn": preview_on},
                   default={"frame": ds.timeline[0], "layout": None},
                   on_frame_change=lambda: None, on_layout_change=lambda: None, on_preview_change=lambda: None)
     request = getattr(result, "preview", None)   # Preview toggle switched on: frame + visible tile arrangement
@@ -318,19 +331,23 @@ def convert_controls(ds: pv.Dataset, request: dict, result) -> None:
     fps = int(getattr(result, "fps", None) or SOURCE_FPS)
     seconds = getattr(result, "seconds", None)
     frames = cv.clip_frames(ds.timeline, request["frame"], fps, seconds)
+    shown = {name for name in request["tiles"] if name}
+    views = [name for name in ds.views if name in shown]         # the previewed cameras, dataset order
     busy = jobs.is_running(ss.get("convert_job"))
     target = f"{ds.root}/{cv.OUTPUT_DIR}/{next_scene_name(ds)}"
     with st.container(horizontal=True, horizontal_alignment="center"):
         clicked = st.button("Converting..." if busy else "Convert", icon=":material/output:", key="convert",
-                            disabled=busy or len(frames) < 2,
+                            disabled=busy or len(frames) < 2 or not views,
                             help="Convert the clip shown above into one MV-Kubric scene. The conversion runs in "
                                  "the background; a pane shows its progress.")
-    st.caption(f"Converts {len(frames)} frames ({frames[0]} to {frames[-1]}) at {fps} fps from {len(ds.views)} "
-               f"views into {target}" if frames else "The clip is empty.")
+    st.caption(f"Converts {len(frames)} frames ({frames[0]} to {frames[-1]}) at {fps} fps from {len(views)} "
+               f"camera{'s' if len(views) != 1 else ''} ({', '.join(views)}) into {target}"
+               if frames else "The clip is empty.")
     if clicked and not busy:
         clip = {"first": frames[0], "last": frames[-1], "frames": len(frames), "fps": fps,
-                "views": len(ds.views), "target": target}
-        ss.convert_job = jobs.start(ds.root, request["frame"], fps, seconds, clean_path(ss[scene_key(ds)]), clip)
+                "views": len(views), "target": target}
+        ss.convert_job = jobs.start(ds.root, request["frame"], fps, seconds, clean_path(ss[scene_key(ds)]), clip,
+                                    views=views)
         st.rerun()                     # the conversion pane lives outside this fragment
 
 
@@ -453,6 +470,8 @@ def controls_help() -> None:
         "- **Step:** click ‹ or › or press the Left / Right arrow key. Hold it to keep stepping "
         "(about 30 frames per second); add Shift to step 10 frames.\n"
         "- **Jump:** type a frame number in the box and press Enter.\n"
+        "- **Cameras:** choose which cameras to show; only these are carried into the preview and "
+        "converted. The grid size fits itself to their number.\n"
         "- **Arrange views:** press the left mouse button on a view, drag it onto another tile "
         "and release; the two swap places. The arrangement is remembered per dataset folder.\n"
         "- **Resize the viewer:** drag its right edge for the width, its bottom edge for the height, "
@@ -568,9 +587,6 @@ def main() -> None:
 
             if ds is None:
                 getattr(st, problem[0])(problem[1])
-                # The grid-size widgets were not drawn, so Streamlit forgets their values;
-                # make the next valid folder start again from the default grid.
-                ss.pop("loaded_root", None)
                 with side:
                     controls_help()
                 return
@@ -579,19 +595,34 @@ def main() -> None:
                 ss[scene_key(ds)] = gtm.remembered_scene(ds.root)
             gtm.use_scene(ds, clean_path(ss[scene_key(ds)]))
 
-            # A new dataset folder resets the grid shape to fit its number of views.
-            if ss.get("loaded_root") != ds.root:
-                ss.loaded_root = ds.root
-                ss.rows, ss.cols = auto_grid(len(ds.views))
+            # Cameras picker (drawn below): all cameras until the user chooses otherwise.
+            cam_key = remembered(camera_key(ds), list(ds.views))
+            ss[cam_key] = [name for name in ss[cam_key] if name in ds.views]
+            cameras = chosen_cameras(ds)
 
-            rows = int(grid_size.number_input("Rows (m)", key="rows", min_value=1, max_value=MAX_GRID, step=1,
-                                             width=130))
-            cols = int(grid_size.number_input("Columns (n)", key="cols", min_value=1, max_value=MAX_GRID, step=1,
-                                             width=130))
-            if rows * cols < len(ds.views):
-                st.caption(f":orange[The grid has {rows * cols} tiles for {len(ds.views)} views. "
-                           "Enlarge it to bring the hidden views in and arrange them.]")
-            viewer(ds, rows, cols, preview_on)
+            # The grid shape fits the number of chosen cameras. The size fields are keyed by folder and
+            # camera count, so a new folder or a different count gives fresh fields holding the fitted
+            # shape, while the user's own changes stay until then. (Writing new values into existing
+            # fields races with the browser, which can send its old values back in a quick rerun.)
+            fit_rows, fit_cols = auto_grid(len(cameras))
+            size_key = f"{ds.root}::{len(cameras)}"
+            rows = int(grid_size.number_input("Rows (m)", key=f"rows::{size_key}", value=fit_rows, min_value=1,
+                                             max_value=MAX_GRID, step=1, width=130))
+            cols = int(grid_size.number_input("Columns (n)", key=f"cols::{size_key}", value=fit_cols, min_value=1,
+                                             max_value=MAX_GRID, step=1, width=130))
+            picker = st.container(horizontal=True, vertical_alignment="center")
+            picker.markdown("Cameras", width="content")
+            picker.multiselect("Cameras", list(ds.views), key=cam_key, label_visibility="collapsed",
+                               placeholder="Choose the cameras to show",
+                               help="Only these cameras are shown here, carried into the preview and converted.")
+            keep(cam_key)
+            if not cameras:
+                st.info("Choose at least one camera to show.")
+            else:
+                if rows * cols < len(cameras):
+                    st.caption(f":orange[The grid has {rows * cols} tiles for {len(cameras)} cameras. "
+                               "Enlarge it to bring the hidden cameras in and arrange them.]")
+                viewer(ds, rows, cols, preview_on, cameras)
 
         if preview_on:
             preview_body(ds, request)

@@ -32,13 +32,15 @@ and each object's true 3D box.
 
 Run by app.py in a separate process:
     python converter.py --dataset <folder> --start <frame> --fps <n> [--seconds <x>]
-                        [--scene-file <usd>] --progress <file.json> [--parent-pid <pid>]
+                        [--scene-file <usd>] [--view <name>]... --progress <file.json> [--parent-pid <pid>]
+    (--view, repeatable: convert only these cameras, in the dataset's order; default all)
 """
 
 from __future__ import annotations
 
 import argparse
 import colorsys
+import dataclasses
 import json
 import math
 import os
@@ -174,6 +176,41 @@ def clip_frames(timeline, start: int, fps: int, seconds: float | None) -> list[i
     return frames
 
 
+def fill_pose_gaps(transforms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(T, 4, 4) object->world poses with NaN in frames where no camera reported the object's 3D box
+    (poses taken from the boxes). Returns the poses with those frames filled - rotation held from the
+    nearest earlier known frame (or the first known one), position interpolated linearly between the
+    known frames around the gap (held at the ends) - and the mask of frames that were really known.
+    MV-Kubric tracks have a position in every frame, so the gaps must not stay NaN."""
+    known = np.isfinite(transforms).all(axis=(1, 2))
+    if known.all() or not known.any():
+        return transforms, known
+    filled = transforms.copy()
+    idx = np.arange(len(transforms))
+    known_idx = idx[known]
+    previous = np.maximum.accumulate(np.where(known, idx, -1))         # last known frame at or before each frame
+    source = np.where(previous >= 0, previous, known_idx[0])
+    filled[~known] = transforms[source[~known]]                          # rotation (and everything else) held
+    for c in range(3):                                                   # row-vector convention: translation = row 3
+        filled[:, 3, c] = np.interp(idx, known_idx, transforms[known, 3, c])
+    return filled, known
+
+
+def frame_ranges(frames: list[int]) -> str:
+    out, start, prev = [], None, None
+    for f in frames:
+        if start is None:
+            start = prev = f
+        elif f == prev + 1:
+            prev = f
+        else:
+            out.append(f"{start}-{prev}" if prev != start else str(start))
+            start = prev = f
+    if start is not None:
+        out.append(f"{start}-{prev}" if prev != start else str(start))
+    return ", ".join(out)
+
+
 def quaternion_wxyz(r: np.ndarray) -> np.ndarray:
     """Unit quaternion (w, x, y, z) of a 3x3 rotation matrix (column-vector convention)."""
     m = r / np.cbrt(np.linalg.det(r)) if np.linalg.det(r) > 0 else r
@@ -252,6 +289,7 @@ def write_json(data, path: Path) -> None:
 
 def hsv_colors(values: np.ndarray) -> np.ndarray:
     """matplotlib's 'hsv' colormap for values in [0, 1)."""
+    values = np.nan_to_num(np.asarray(values, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     return (np.array([colorsys.hsv_to_rgb(v % 1.0, 1.0, 1.0) for v in values]) * 255).astype(np.uint8)
 
 
@@ -382,15 +420,28 @@ def new_scene_folder(root: Path) -> Path:
 class Scene:
     """Everything known about the clip: cameras, depth access, object poses and masks."""
 
-    def __init__(self, ds: pv.Dataset, frames: list[int], fps: int, scene_file: str):
-        self.ds, self.frames, self.fps = ds, frames, fps
-        self.T, self.V = len(frames), len(ds.views)
+    def __init__(self, ds: pv.Dataset, frames: list[int], fps: int, scene_file: str, views: list[str] | None = None):
+        self.frames, self.fps = frames, fps
+        # Ground truth and poses come from all cameras (each camera only reports what it sees) ...
         self.truth = gtm.get(ds)
         self.pose = gtm.poses(ds, scene_file)
+        # ... while images, depth and the output views come from the chosen cameras only.
+        keep = [i for i, name in enumerate(ds.views) if not views or name in views]
+        if not keep:
+            raise ValueError(f"None of the chosen cameras {views} is in this dataset ({', '.join(ds.views)}).")
+        self.camera_matrices = [self.truth.camera_matrices[i] for i in keep]
+        self.ds = dataclasses.replace(
+            ds, views=tuple(ds.views[i] for i in keep), frames=tuple(ds.frames[i] for i in keep),
+            name_patterns=tuple(ds.name_patterns[i] for i in keep), view_paths=tuple(ds.view_paths[i] for i in keep))
+        self.T, self.V = len(frames), len(keep)
         index = {f: i for i, f in enumerate(ds.timeline)}
         self.rows = [index[f] for f in frames]
         self.objects = list(self.truth.objects)
-        self.object_poses = [self.pose.transforms[o.path][self.rows] for o in self.objects]   # (T, 4, 4) row-vector
+        # (T, 4, 4) row-vector poses for the clip; frames without a 3D box are filled (see fill_pose_gaps),
+        # pose_known says which frames were really known (used for masks and for sampling points).
+        filled = [fill_pose_gaps(self.pose.transforms[o.path]) for o in self.objects]
+        self.object_poses = [poses[self.rows] for poses, _known in filled]
+        self.pose_known = [known[self.rows] for _poses, known in filled]
         self.W, self.H = ds.image_size
         # ids like the generator's asset order: dome 1, cameras 2..V+1, then the objects
         self.dome_id = 1
@@ -404,7 +455,7 @@ class Scene:
     def _camera(self, v: int) -> dict:
         view_dir = self.ds.view_paths[v]
         raw = json.load(open(os.path.join(view_dir, gtm.CAMERA_DIR, f"camera_params_{self.frames[0]:04d}.json")))
-        cams = self.truth.camera_matrices[v]
+        cams = self.camera_matrices[v]
         matrices, worlds = [], []
         for f in self.frames:
             _first, view, proj, _w, _h = gtm._camera_at(cams, f)
@@ -501,9 +552,9 @@ class Scene:
         """Pixels whose depth point lies inside an object's true 3D box (above the floor)."""
         seg = np.full((self.H, self.W), self.dome_id, dtype=np.int32)
         view, proj = self.cameras[v]["matrices"][k]
-        for obj, oid, poses in zip(self.objects, self.object_ids, self.object_poses):
+        for obj, oid, poses, known in zip(self.objects, self.object_ids, self.object_poses, self.pose_known):
             to_world = poses[k]
-            if not np.isfinite(to_world).all():
+            if not known[k]:
                 continue
             lo, hi = obj.box_min, obj.box_max
             corners = np.array([[x, y, z, 1.0] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
@@ -549,7 +600,7 @@ def sample_tracks(scene: Scene, n_points: int, seed: int, progress: Progress):
                 background.append(world[ids == scene.dome_id])
             for j, (oid, poses) in enumerate(zip(scene.object_ids, scene.object_poses)):
                 sel = ids == oid
-                if sel.any() and np.isfinite(poses[k]).all():
+                if sel.any() and scene.pose_known[j][k]:
                     local = np.concatenate([world[sel], np.ones((sel.sum(), 1))], axis=1) @ np.linalg.inv(poses[k])
                     per_object[j].append(local[:, :3])
             progress.advance("tracks", detail=f"Depth of frame {scene.frames[k]}, {scene.ds.views[v]}")
@@ -686,6 +737,8 @@ def write_view(scene: Scene, v: int, out: Path, tracks_3d: np.ndarray, track_ids
     for oid in visible:
         j = scene.object_ids.index(oid)
         obj, poses = scene.objects[j], scene.object_poses[j]
+        if not np.isfinite(poses).all():
+            continue                                                            # never had a 3D box in the clip
         rotations = np.array([p[:3, :3].T for p in poses])                     # row-vector -> column-vector
         positions = np.array([p[3, :3] for p in poses])
         lo, hi = obj.box_min, obj.box_max
@@ -732,7 +785,7 @@ def write_videos(scene: Scene, out: Path, tracks_3d, track_ids, views_2d, progre
     T, N = tracks_3d.shape[:2]
     progress.start("videos", "Drawing the tracks", total=T)
     group = np.sqrt((tracks_3d[0] ** 2).sum(axis=1))                        # tracks_v1: distance from the origin
-    colors_v1 = hsv_colors(group / (group.max() + 1))
+    colors_v1 = hsv_colors(group / (np.nanmax(group) + 1) if np.isfinite(group).any() else group)
     perm = np.random.default_rng(VIDEO_SEED).permutation(N)                  # tracks_v2: random colours
     colors_v2_all = rainbow_colors(perm / max(N, 1))
     selectors = []
@@ -825,11 +878,19 @@ def convert(args, progress: Progress) -> None:
     frames = clip_frames(ds.timeline, args.start, args.fps, args.seconds)
     if len(frames) < 2:
         raise ValueError("The clip has fewer than 2 frames; choose an earlier start frame or more seconds.")
-    scene = Scene(ds, frames, args.fps, args.scene_file or "")
+    scene = Scene(ds, frames, args.fps, args.scene_file or "", args.view)
     if scene.pose.source != "scene":
         progress.note("No exact poses from a scene file: object motion comes from the recorded 3D boxes, "
                       "which keep the first frame's orientation (objects that turn are tracked wrongly). "
                       + (scene.pose.error or ""))
+    for name, known in zip(scene.object_names, scene.pose_known):
+        missing = [f for f, ok in zip(frames, known) if not ok]
+        if missing and known.any():
+            progress.note(f"{name}: no camera reported its 3D box in frames {frame_ranges(missing)}, so its position "
+                          "there is interpolated between the frames around them; its points count as hidden there.")
+        elif missing:
+            progress.note(f"{name}: no camera sees it anywhere in the clip (no 3D box in any of its frames), "
+                          "so it has no tracked points.")
     if not all(scene.recorded_masks):
         progress.note("No instance_segmentation in the recording: object pixels come from the depth and each "
                       "object's true 3D box. Record instance_segmentation for exact masks.")
@@ -860,7 +921,7 @@ def convert(args, progress: Progress) -> None:
         "resolution": [scene.W, scene.H], "save_state": False, "scratch_dir": None, "seed": seed,
         "show_debug_plots": False, "step_rate": SOURCE_FPS,
         # where the scene came from
-        "source": "isaac_sim", "source_dataset": root, "source_views": list(ds.views),
+        "source": "isaac_sim", "source_dataset": root, "source_views": list(scene.ds.views),
         "source_frames": frames, "source_fps": SOURCE_FPS, "scene_file": args.scene_file or None,
         "pose_source": scene.pose.source,
         "segmentation_source": "instance_segmentation" if all(scene.recorded_masks) else "depth_and_3d_boxes",
@@ -896,6 +957,7 @@ def main() -> None:
     ap.add_argument("--fps", type=int, default=SOURCE_FPS)
     ap.add_argument("--seconds", type=float, default=None)
     ap.add_argument("--scene-file", default="")
+    ap.add_argument("--view", action="append", default=None, help="camera (view folder) to convert; repeatable")
     ap.add_argument("--progress", required=True)
     ap.add_argument("--parent-pid", type=int, default=None)
     args = ap.parse_args()
