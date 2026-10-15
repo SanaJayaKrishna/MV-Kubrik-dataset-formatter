@@ -7,6 +7,8 @@
 //
 // Mouse and keys:
 //   < > buttons, Left/Right keys    step one frame; hold to keep stepping (Shift: 10)
+//   frame slider under the views    drag (or click) to any frame; while dragging, the views follow as
+//                                   fast as their images arrive (always the latest slider position)
 //   frame box + Enter               jump to the nearest existing frame
 //   left-button drag on a view      drop it on another tile to swap the two
 //   Preview toggle                  turns this pane into the preview (frame + arrangement go along)
@@ -19,6 +21,7 @@ const SYNC_DELAY_MS = 400;    // report the frame to Python once navigation paus
 const HOLD_DELAY_MS = 350;    // press and hold: repeating starts after this...
 const HOLD_INTERVAL_MS = 33;  // ...then about 30 steps per second, each shown before the next
 const DRAG_THRESHOLD_PX = 6;  // a press on a view becomes a drag after moving this far
+const THUMB_PX = 16;          // width of the slider's handle (viewer.css)
 
 const savedFrame = new Map(); // dataset folder -> current frame number (survives reruns)
 const savedSlots = new Map(); // dataset folder -> tile arrangement as view names (null = empty tile)
@@ -96,6 +99,22 @@ function buildViewer(root, data) {
     tiles.push({ fig, img, note, cap });
   }
 
+  // Frame slider under the views: first and last frame at the ends, a bubble with the frame number
+  // while hovering or dragging, and shading where a shown view has no image.
+  const scrub = el("div", "mvk-scrub", root);
+  el("span", "mvk-scrub-end", scrub).textContent = String(timeline[0]);
+  const track = el("div", "mvk-scrub-track", scrub);
+  const slider = el("input", "mvk-slider", track);
+  slider.type = "range";
+  slider.min = "0";
+  slider.max = String(Math.max(0, n - 1));
+  slider.step = "1";
+  slider.setAttribute("aria-label", "Frame slider");
+  const bubble = el("div", "mvk-bubble", track);
+  bubble.hidden = true;
+  el("span", "mvk-scrub-end", scrub).textContent = String(timeline[n - 1]);
+  scrub.hidden = n < 2;
+
   const nav = el("div", "mvk-nav", root);
   const prev = el("button", "mvk-btn", nav);
   prev.innerHTML = CHEVRON("M15 5l-7 7 7 7");
@@ -127,6 +146,9 @@ function buildViewer(root, data) {
     press: null,            // left button down on a view, not yet moved far enough to drag
     drag: null,             // drag state while rearranging tiles
     observer: null,         // ResizeObserver that refits the grid to the panel height
+    scrubbing: false,       // the slider is being dragged
+    scrubTarget: null,      // slider position waiting to be shown
+    scrubRaf: 0,
     setStateValue: null,
     setTriggerValue: null,
     syncTimer: 0,
@@ -154,12 +176,53 @@ function buildViewer(root, data) {
     return parts.join("  ·  ");
   }
 
-  function updateNav() {
-    const frame = timeline[v.idx];
-    if (root.getRootNode().activeElement !== input) input.value = String(frame);  // not while typing
+  const fraction = (i) => (n > 1 ? i / (n - 1) : 0);
+
+  function paintSlider(i, setValue) {
+    if (setValue) slider.value = String(i);
+    slider.style.setProperty("--fill", `${(fraction(i) * 100).toFixed(3)}%`);
+  }
+
+  function updateNav() {                  // while the slider is dragged, the numbers follow the slider
+    const i = v.scrubbing ? Number(slider.value) : v.idx;
+    if (root.getRootNode().activeElement !== input) input.value = String(timeline[i]);  // not while typing
     prev.disabled = v.idx <= 0;
     next.disabled = v.idx >= n - 1;
-    status.textContent = `${v.idx + 1} of ${n}`;
+    status.textContent = `${i + 1} of ${n}`;
+    if (!v.scrubbing) paintSlider(v.idx, true);
+  }
+
+  function updateGaps() {                 // shade the parts of the slider where a shown view has no image
+    const views = visibleViews();
+    const stops = [];
+    let start = -1;
+    for (let i = 0; i <= n; i++) {
+      const gap = i < n && views.some((view) => !has(view, timeline[i]));
+      if (gap && start < 0) start = i;
+      if (!gap && start >= 0) {
+        const a = Math.max(0, fraction(start - 0.5) * 100).toFixed(3);
+        const b = Math.min(100, fraction(i - 0.5) * 100).toFixed(3);
+        stops.push(`transparent ${a}%`, `var(--mvk-gap) ${a}%`, `var(--mvk-gap) ${b}%`, `transparent ${b}%`);
+        start = -1;
+      }
+    }
+    slider.style.setProperty("--gaps", stops.length ? `linear-gradient(to right, ${stops.join(", ")})` : "none");
+  }
+
+  function showBubble(i) {
+    const width = slider.getBoundingClientRect().width;
+    const frame = timeline[i];
+    const views = visibleViews();
+    const lacking = views.filter((view) => !has(view, frame)).length;
+    bubble.textContent = lacking ? `${frame}  ·  no image in ${lacking} of ${views.length}` : String(frame);
+    bubble.style.left = `${THUMB_PX / 2 + fraction(i) * (width - THUMB_PX)}px`;
+    bubble.hidden = false;
+  }
+
+  function indexAt(clientX) {             // slider position under the pointer
+    const r = slider.getBoundingClientRect();
+    const f = (clientX - r.left - THUMB_PX / 2) / Math.max(1, r.width - THUMB_PX);
+    return Math.round(Math.max(0, Math.min(1, f)) * (n - 1));
   }
 
   function paint() {                       // draw v.last into the tiles, all in the same task
@@ -223,16 +286,72 @@ function buildViewer(root, data) {
     preloader.set(urls);
   }
 
-  function go(i, delta) {
+  function go(i, delta, scrubbing) {
     i = Math.max(0, Math.min(n - 1, i));
     const changed = i !== v.idx;
     v.idx = i;
     savedFrame.set(data.root, timeline[i]);
     updateNav();
     show(i);
-    prefetch(i, delta || 1);
+    if (scrubbing) {                      // the neighbours of a passing frame are not needed: cancel
+      preloader.set([]);                  // the queued preloads and the server's queued decodes
+      warm(`${data.base}/warm/${data.ds}?w=${data.w}&v=${visibleViews().map(datasetView).join(",")}&f=${timeline[i]}`);
+    } else {
+      prefetch(i, delta || 1);
+    }
     if (changed) scheduleSync();
   }
+
+  // ---- frame slider: show the latest slider position as soon as the previous frame is on screen,
+  // so dragging never queues up requests for frames that have been passed
+
+  function scrubLoop() {
+    v.scrubRaf = 0;
+    const i = v.scrubTarget;
+    if (i === null) return;
+    if (v.shownSeq !== v.seq) { v.scrubRaf = requestAnimationFrame(scrubLoop); return; }   // still loading
+    v.scrubTarget = null;
+    if (i !== v.idx) go(i, i > v.idx ? 1 : -1, v.scrubbing);
+    else if (!v.scrubbing) prefetch(i, 1);   // released where the views already are: load around it
+  }
+
+  function scrubTo(i) {
+    v.stopHold();
+    v.scrubTarget = i;
+    paintSlider(i, false);
+    updateNav();
+    if (!v.scrubRaf) v.scrubRaf = requestAnimationFrame(scrubLoop);
+  }
+
+  function endScrub() {
+    if (!v.scrubbing) return;
+    v.scrubbing = false;
+    bubble.hidden = !slider.matches(":hover");
+    scrubTo(Number(slider.value));
+  }
+
+  slider.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    v.scrubbing = true;
+    showBubble(indexAt(e.clientX));
+    document.addEventListener("pointerup", endScrub, { once: true });   // also when released elsewhere
+  });
+  slider.addEventListener("input", () => {
+    const i = Number(slider.value);
+    scrubTo(i);
+    if (v.scrubbing || !bubble.hidden) showBubble(i);
+  });
+  slider.addEventListener("change", endScrub);
+  slider.addEventListener("pointercancel", endScrub);
+  slider.addEventListener("pointermove", (e) => { if (!v.scrubbing) showBubble(indexAt(e.clientX)); });
+  slider.addEventListener("pointerleave", () => { if (!v.scrubbing) bubble.hidden = true; });
+  slider.addEventListener("keydown", (e) => {   // Left/Right as everywhere else (Shift: 10, hold to repeat);
+    if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;   // Home / End / Page keys stay native
+    e.preventDefault();
+    if (e.repeat) return;
+    const dir = e.key === "ArrowRight" ? 1 : -1;
+    v.startHold(e.shiftKey ? 10 * dir : dir, e.key);
+  });
 
   function scheduleSync() {
     clearTimeout(v.syncTimer);
@@ -357,6 +476,7 @@ function buildViewer(root, data) {
     savedSlots.set(data.root, names);
     storageSet(`mvk:layout:${data.root}`, JSON.stringify(names));
     if (v.setStateValue) v.setStateValue("layout", names);
+    updateGaps();                          // other views may now be visible
     paint();                               // instant: both views are already loaded
     show(v.idx);                           // a view that just became visible loads its image
   };
@@ -413,10 +533,12 @@ function buildViewer(root, data) {
   v.observer.observe(root);
   v.destroy = () => {
     v.stopHold();
+    cancelAnimationFrame(v.scrubRaf);
     v.endDrag(false);
     v.observer.disconnect();
   };
 
+  updateGaps();
   paint();
   go(v.idx, 1);
   return v;

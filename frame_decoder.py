@@ -7,8 +7,11 @@ for part of it, so threads top out near 150 images/s; separate processes scale w
 """
 
 import io
+import os
 
 from PIL import Image
+
+SOURCE_MTIME = os.path.getmtime(__file__)   # app.py compares it with the file: changed code needs a restart
 
 JPEG_QUALITY = 85
 

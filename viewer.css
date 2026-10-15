@@ -151,3 +151,81 @@
 .mvk-toggle[aria-checked="true"] .mvk-switch { background: var(--st-primary-color, #ff4b4b); }
 .mvk-toggle[aria-checked="true"] .mvk-switch::after { transform: translateX(1rem); }
 .mvk-toggle:focus-visible { outline: 2px solid var(--st-primary-color, #ff4b4b); border-radius: 0.4rem; }
+
+/* Frame slider under the views (viewer.js). --fill: played part; --gaps: shading where a shown view
+   has no image. The handle is THUMB_PX (16 px) wide. */
+.mvk-scrub { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.75rem; }
+.mvk-scrub[hidden] { display: none; }
+.mvk-scrub-end {
+  min-width: 2.5rem;
+  font-size: 0.8rem;
+  color: var(--st-gray-text-color, #808495);
+  font-variant-numeric: tabular-nums;
+}
+.mvk-scrub-end:first-child { text-align: right; }
+.mvk-scrub-track { position: relative; flex: 1 1 auto; min-width: 0; display: flex; align-items: center; }
+.mvk-slider {
+  --mvk-gap: rgba(255, 164, 33, 0.9);
+  --mvk-rail: var(--st-border-color, rgba(49, 51, 63, 0.2));
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 1.5rem;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+  touch-action: none;
+}
+.mvk-slider:focus { outline: none; }
+.mvk-slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 3px;
+  background-image: var(--gaps, none),
+    linear-gradient(to right, var(--st-primary-color, #ff4b4b) var(--fill, 0%), var(--mvk-rail) var(--fill, 0%));
+}
+.mvk-slider::-moz-range-track {
+  height: 6px;
+  border-radius: 3px;
+  background-image: var(--gaps, none),
+    linear-gradient(to right, var(--st-primary-color, #ff4b4b) var(--fill, 0%), var(--mvk-rail) var(--fill, 0%));
+}
+.mvk-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  width: 16px;
+  height: 16px;
+  margin-top: -5px;
+  border-radius: 50%;
+  border: 2px solid var(--st-background-color, #fff);
+  background: var(--st-primary-color, #ff4b4b);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  transition: transform 0.1s;
+}
+.mvk-slider::-moz-range-thumb {
+  box-sizing: border-box;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid var(--st-background-color, #fff);
+  background: var(--st-primary-color, #ff4b4b);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+.mvk-slider:hover::-webkit-slider-thumb, .mvk-slider:active::-webkit-slider-thumb { transform: scale(1.2); }
+.mvk-slider:focus-visible::-webkit-slider-thumb { outline: 2px solid var(--st-primary-color, #ff4b4b); outline-offset: 2px; }
+.mvk-slider:focus-visible::-moz-range-thumb { outline: 2px solid var(--st-primary-color, #ff4b4b); outline-offset: 2px; }
+.mvk-bubble {
+  position: absolute;
+  bottom: 100%;
+  z-index: 5;
+  margin-bottom: 2px;
+  padding: 0.1rem 0.45rem;
+  transform: translateX(-50%);
+  border-radius: 0.35rem;
+  background: var(--st-text-color, #31333f);
+  color: var(--st-background-color, #fff);
+  font-size: 0.78rem;
+  white-space: nowrap;
+  pointer-events: none;
+  font-variant-numeric: tabular-nums;
+}
+.mvk-bubble[hidden] { display: none; }

@@ -1,9 +1,9 @@
 """MV-Kubric dataset app, phase 1: synchronized multi-view frame viewer.
 
 Point it at a recording folder laid out as  <folder>/<view>/rgb/rgb_<frame>.png
-(for example ~/docker/isaac-sim/workspace/dataset_test with view01 ... view06,
+(for example ~/docker/isaac-sim/workspace/mvk_dataset with cameras S0100 ... S2005,
 or the Replicator_XX folders written by the Synthetic Data Recorder). The page
-shows the same frame of every view in an m x n grid and steps all views together.
+shows the same frame of the chosen cameras in an m x n grid and steps them together.
 
 Start with ~/mvkubric_app/run.sh and open http://localhost:8501.
 
@@ -13,12 +13,11 @@ frame_decoder.py (PNG decoding in worker processes), converter.py + jobs.py (the
 conversion, run in a background process), viewer.js / viewer.css (the grid, runs in the browser),
 preview.js / preview.css (the preview player), common.js (browser code shared by
 both), resizer.js (drag handles that resize the viewer and preview panes).
-Later phases will add the conversion to MV-Kubric
-(see ~/docker/isaac-sim/workspace/convert_to_mvkubric.py).
 """
 
 from __future__ import annotations
 
+import bisect
 import math
 import os
 import time
@@ -31,7 +30,7 @@ import groundtruth as gtm
 import jobs
 import previews as pv
 
-DEFAULT_FOLDER = "/home/jk/docker/isaac-sim/workspace/dataset_test"
+DEFAULT_FOLDER = "/home/jk/docker/isaac-sim/workspace/mvk_dataset"
 MAX_GRID = 10   # upper limit for rows and for columns
 SOURCE_FPS = 30  # capture rate of the recordings (Isaac Sim stage timeCodesPerSecond)
 # Overlay colours of tracked objects (by object index), bright enough for the warehouse scenes.
@@ -125,28 +124,19 @@ def browse_to(path: str) -> None:
     st.session_state.browse_dir = path
 
 
-def choose_folder(path: str) -> None:
-    st.session_state.folder = path
+def set_state(key: str, value) -> None:
+    st.session_state[key] = value
 
 
-@st.dialog("Choose dataset folder", width="large")
-def browse_dialog() -> None:
-    cur = Path(st.session_state.browse_dir)
+def folder_browser(cur: Path) -> list[str]:
+    """Shared part of the folder dialogs: where we are, Up and Open subfolder. Returns the subfolders."""
     st.code(str(cur), language=None)
     try:
         subdirs = sorted((e.name for e in os.scandir(cur) if e.is_dir() and not e.name.startswith(".")),
                          key=pv.natural_key)
-        views = pv.view_dirs(cur)
     except OSError as exc:
         st.error(f"Cannot read this folder: {exc}")
-        subdirs, views = [], []
-
-    if views:
-        names = ", ".join(v for v, _ in views[:8]) + (" ..." if len(views) > 8 else "")
-        st.success(f"{len(views)} view folder(s) with rgb/ found: {names}")
-    else:
-        st.caption("No view folders with an rgb/ subfolder here. Open a subfolder or go up.")
-
+        subdirs = []
     up, pick = st.columns([1, 4], vertical_alignment="bottom")
     up.button("Up", icon=":material/arrow_upward:", width="stretch", disabled=cur.parent == cur,
               on_click=browse_to, args=(str(cur.parent),))
@@ -154,9 +144,42 @@ def browse_dialog() -> None:
     pick.selectbox("Open subfolder", subdirs, index=None, key=pick_key,
                    placeholder=f"{len(subdirs)} subfolders (type to filter)" if subdirs else "No subfolders",
                    disabled=not subdirs, on_change=browse_into, args=(str(cur), pick_key))
+    return subdirs
 
+
+@st.dialog("Choose dataset folder", width="large")
+def browse_dialog() -> None:
+    cur = Path(st.session_state.browse_dir)
+    try:
+        views = pv.view_dirs(cur)
+    except OSError:
+        views = []
+    folder_browser(cur)
+    if views:
+        names = ", ".join(v for v, _ in views[:8]) + (" ..." if len(views) > 8 else "")
+        st.success(f"{len(views)} view folder(s) with rgb/ found: {names}")
+    else:
+        st.caption("No view folders with an rgb/ subfolder here. Open a subfolder or go up.")
     if st.button("Use this folder", type="primary", icon=":material/check:", disabled=not views,
-                 on_click=choose_folder, args=(str(cur),)):
+                 on_click=set_state, args=("folder", str(cur))):
+        st.rerun()
+
+
+@st.dialog("Choose where to save the MV-Kubric scenes", width="large")
+def output_dialog(key: str) -> None:
+    cur = Path(st.session_state.browse_dir)
+    subdirs = folder_browser(cur)
+    scenes = [name for name in subdirs if name.isdigit()]
+    st.caption(f"Already holds {len(scenes)} scene folder{'s' if len(scenes) != 1 else ''} ({cv.frame_ranges(sorted(int(n) for n in scenes))}); "
+               "a new scene gets the next number." if scenes else
+               "Each conversion adds one numbered scene folder here (1, 2, 3, ...).")
+    new = clean_path(st.text_input("New folder (optional)", key=f"output_new::{cur}",
+                                   placeholder="name of a folder to create here, e.g. mv_kubric"))
+    target = cur / new if new else cur
+    if new and ("/" in new or new in (".", "..")):
+        st.error("Type a single folder name, without slashes.")
+    elif st.button(f"Save to {target}", type="primary", icon=":material/check:",
+                   on_click=set_state, args=(key, str(target))):
         st.rerun()
 
 
@@ -263,11 +286,17 @@ def keep(key: str) -> None:
 
 def ground_truth_controls(ds: pv.Dataset) -> dict:
     """Top of the preview: one object picker. Choosing objects turns the ground-truth overlay on,
-    an empty picker turns it off. Returns the overlay settings."""
-    with st.spinner("Reading ground truth..."):    # once per dataset (cached), lists the objects
-        truth = gtm.get(ds)
+    an empty picker turns it off. Returns the overlay settings. ds holds the previewed cameras only,
+    so the boxes are read from (and the objects are those seen by) these cameras."""
+    if not gtm.is_loaded(ds):
+        with st.spinner(f"Reading ground truth of {len(ds.views)} camera{'s' if len(ds.views) != 1 else ''}..."):
+            gtm.get(ds)                              # once per camera choice (cached)
+    truth = gtm.get(ds)
     objects = {o.path: (i, o) for i, o in enumerate(truth.objects)}
     key = remembered(f"gt_objects::{ds.root}", [])
+    valid = [path for path in st.session_state[key] if path in objects]   # other cameras see other objects
+    if valid != st.session_state[key]:
+        st.session_state[key] = valid
     row = st.container(horizontal=True, vertical_alignment="center")
     row.markdown("Ground truth values", width="content")
     chosen = row.multiselect(
@@ -301,11 +330,23 @@ def ground_truth_controls(ds: pv.Dataset) -> dict:
 
 
 @st.fragment
-def preview_body(ds: pv.Dataset, request: dict) -> None:
-    """The pane's content while the Preview toggle is on (the viewer is hidden, not removed)."""
+def preview_body(ds: pv.Dataset, request: dict, full: pv.Dataset) -> None:
+    """The pane's content while the Preview toggle is on (the viewer is hidden, not removed).
+    ds is the recording restricted to the previewed cameras and the frames they all have (see
+    previewed()); full is the whole recording."""
+    if len(ds.timeline) < len(full.timeline):
+        short = [name for name, frames in zip(ds.views, ds.frames) if len(frames) < len(full.timeline)]
+        st.caption(f":orange[{', '.join(short)} {'has' if len(short) == 1 else 'have'} fewer frames than the "
+                   f"recording, so the preview and the conversion use the frames all {len(ds.views)} cameras have: "
+                   f"{cv.frame_ranges(list(ds.timeline))}.]")
+    if len(ds.timeline) < 2:
+        st.warning("The previewed cameras have no frames in common. Choose other cameras.")
+        return
     overlay = ground_truth_controls(ds)
+    state = st.session_state.get("player") or {}       # app.py's copy of the player's FPS / Seconds
+    reported = {"fps": state.get("fps", SOURCE_FPS), "seconds": state.get("seconds")}
     player = player_component(read("common.js", "preview.js"), read("viewer.css", "preview.css"))
-    result = player(key="player", data={**preview_data(ds, request), "gt": overlay},
+    result = player(key="player", data={**preview_data(ds, request), "gt": overlay, "reported": reported},
                     default={"fps": SOURCE_FPS, "seconds": None},
                     on_fps_change=lambda: None, on_seconds_change=lambda: None, on_close_change=lambda: None)
     # The player reports FPS and clip length (st.session_state.player["fps"] / ["seconds"], None =
@@ -316,38 +357,76 @@ def preview_body(ds: pv.Dataset, request: dict) -> None:
     convert_controls(ds, request, result)
 
 
-def next_scene_name(ds: pv.Dataset) -> str:
-    folder = Path(ds.root) / cv.OUTPUT_DIR
-    try:
-        taken = [int(p.name) for p in folder.iterdir() if p.is_dir() and p.name.isdigit()]
-    except OSError:
-        taken = []
-    return str(max(taken, default=0) + 1)
+def nearest_frame(timeline, frame: int) -> int:
+    i = bisect.bisect_left(timeline, frame)
+    return min(timeline[max(0, i - 1):i + 1], key=lambda f: abs(f - frame))
+
+
+def output_key(ds: pv.Dataset) -> str:
+    return f"output::{ds.root}"
+
+
+def output_problem(folder: str) -> str | None:
+    """Why the scenes cannot be saved in this folder, or None."""
+    if not os.path.isabs(folder):
+        return "Give the full path of the output folder (starting with /)."
+    if os.path.exists(folder) and not os.path.isdir(folder):
+        return f"{folder} is a file, not a folder."
+    return None
+
+
+def output_controls(ds: pv.Dataset) -> str:
+    """'Save to' field above Convert: the folder that receives the scene folders (1, 2, 3, ...).
+    Starts at the app's default, <dataset>/mv_kubric, and is remembered per dataset folder."""
+    ss = st.session_state
+    default = cv.default_output(ds.root)
+    key = remembered(output_key(ds), default)
+    row = st.container(horizontal=True, vertical_alignment="bottom", key="mvk_output_row")
+    row.text_input("Save to", key=key, placeholder=default,
+                   help="Folder for the MV-Kubric scenes: each conversion adds a numbered scene folder (1, 2, 3, ...) "
+                        "in the reference layout. It is created if it does not exist.")
+    keep(key)
+    if row.button("Browse...", icon=":material/folder_open:", key="output_browse"):
+        ss.browse_dir = str(existing_dir(ss[key] or default))
+        output_dialog(key)
+    folder = clean_path(ss[key]) or default
+    if folder != default:
+        row.button("Default", icon=":material/restart_alt:", key="output_default", on_click=set_state,
+                   args=(key, default), help=f"Back to {default}")
+    return folder
 
 
 def convert_controls(ds: pv.Dataset, request: dict, result) -> None:
-    """Convert button: the clip shown in the preview (start frame, FPS, Seconds) becomes one scene."""
+    """Save-to folder and Convert button: the clip shown in the preview (start frame, FPS, Seconds) of
+    the previewed cameras (ds) becomes one scene."""
     ss = st.session_state
     fps = int(getattr(result, "fps", None) or SOURCE_FPS)
     seconds = getattr(result, "seconds", None)
-    frames = cv.clip_frames(ds.timeline, request["frame"], fps, seconds)
-    shown = {name for name in request["tiles"] if name}
-    views = [name for name in ds.views if name in shown]         # the previewed cameras, dataset order
+    start = nearest_frame(ds.timeline, request["frame"])          # as the player: the nearest frame all cameras have
+    frames = cv.clip_frames(ds.timeline, start, fps, seconds)
+    views = list(ds.views)                                        # the previewed cameras, dataset order
+    output = output_controls(ds)
+    problem = output_problem(output)
     busy = jobs.is_running(ss.get("convert_job"))
-    target = f"{ds.root}/{cv.OUTPUT_DIR}/{next_scene_name(ds)}"
+    target = f"{output.rstrip('/')}/{cv.next_scene_number(Path(output))}"
     with st.container(horizontal=True, horizontal_alignment="center"):
         clicked = st.button("Converting..." if busy else "Convert", icon=":material/output:", key="convert",
-                            disabled=busy or len(frames) < 2 or not views,
+                            disabled=busy or len(frames) < 2 or not views or problem is not None,
                             help="Convert the clip shown above into one MV-Kubric scene. The conversion runs in "
                                  "the background; a pane shows its progress.")
-    st.caption(f"Converts {len(frames)} frames ({frames[0]} to {frames[-1]}) at {fps} fps from {len(views)} "
-               f"camera{'s' if len(views) != 1 else ''} ({', '.join(views)}) into {target}"
-               if frames else "The clip is empty.")
-    if clicked and not busy:
+    if problem:
+        st.error(problem)
+    elif frames:
+        st.caption(f"Converts {len(frames)} frames ({frames[0]} to {frames[-1]}) at {fps} fps from {len(views)} "
+                   f"camera{'s' if len(views) != 1 else ''} ({', '.join(views)}) into {target}"
+                   + ("" if os.path.isdir(output) else f"  \n{output} does not exist yet and will be created."))
+    else:
+        st.caption("The clip is empty.")
+    if clicked and not busy and problem is None:
         clip = {"first": frames[0], "last": frames[-1], "frames": len(frames), "fps": fps,
                 "views": len(views), "target": target}
-        ss.convert_job = jobs.start(ds.root, request["frame"], fps, seconds, clean_path(ss[scene_key(ds)]), clip,
-                                    views=views)
+        ss.convert_job = jobs.start(ds.root, start, fps, seconds, clean_path(ss[scene_key(ds)]), clip,
+                                    views=views, output=output)
         st.rerun()                     # the conversion pane lives outside this fragment
 
 
@@ -443,7 +522,7 @@ def remember_scene(root: str, key: str) -> None:
     gtm.remember_scene(root, clean_path(st.session_state.get(key, "")))
 
 
-def dataset_info(ds: pv.Dataset) -> None:
+def dataset_info(ds: pv.Dataset, shown: pv.Dataset | None) -> None:
     w, h = ds.image_size or (0, 0)
     st.markdown("##### Dataset")
     st.caption(ds.root)
@@ -451,7 +530,7 @@ def dataset_info(ds: pv.Dataset) -> None:
                   placeholder="the .usd file this recording was made from",
                   help="Gives the exact object poses for the ground-truth points. The recorded 3D boxes "
                        "keep each object's first-frame orientation, so objects that turn need this file.")
-    pose = gtm.cached_poses(ds)
+    pose = gtm.cached_poses(shown or ds)
     if pose is not None and pose.source == "scene":
         st.caption("Exact object poses come from this file.")
     st.markdown(f"**{len(ds.views)}** view{'s' if len(ds.views) != 1 else ''}  ·  "
@@ -469,9 +548,14 @@ def controls_help() -> None:
     st.markdown(
         "- **Step:** click ‹ or › or press the Left / Right arrow key. Hold it to keep stepping "
         "(about 30 frames per second); add Shift to step 10 frames.\n"
+        "- **Slide:** drag the bar under the views to any frame (or click on it); the views follow while "
+        "you drag, and the bubble shows the frame number. The ends show the first and last frame; orange "
+        "parts are frames where a shown camera has no image. With the bar focused, Left / Right step as "
+        "above, Home / End go to the first / last frame.\n"
         "- **Jump:** type a frame number in the box and press Enter.\n"
-        "- **Cameras:** choose which cameras to show; only these are carried into the preview and "
-        "converted. The grid size fits itself to their number.\n"
+        "- **Cameras:** none are shown at first; choose the cameras to show (type part of a name to "
+        "filter). Only these are carried into the preview and converted, and the ground truth is read "
+        "from them. The grid size fits itself to their number.\n"
         "- **Arrange views:** press the left mouse button on a view, drag it onto another tile "
         "and release; the two swap places. The arrangement is remembered per dataset folder.\n"
         "- **Resize the viewer:** drag its right edge for the width, its bottom edge for the height, "
@@ -486,14 +570,15 @@ def controls_help() -> None:
         "n × X frames, or stop at the last recorded frame if the recording is shorter; leave it empty to "
         "play to the end. The total number of frames is shown under the player.\n"
         "- **Convert:** in the preview, Convert turns the clip shown (start frame, FPS, Seconds) into one "
-        f"MV-Kubric scene in the dataset folder's {cv.OUTPUT_DIR}/ folder (1, 2, 3, ...). A pane shows the "
-        "progress; it runs in the background, so the app stays usable.\n"
+        "MV-Kubric scene: a numbered folder (1, 2, 3, ...) in the Save to folder above the button, by "
+        f"default the dataset folder's {cv.OUTPUT_DIR}/. Type another path or click Browse to save "
+        "elsewhere (a folder that does not exist is created). A pane shows the progress; it runs in the "
+        "background, so the app stays usable.\n"
         "- **Ground truth:** in the preview, choose objects in Ground truth values (clear it to "
         "hide the overlay). Each object gets 48 tracked points on its real surface, taken from the "
         "recorded depth, moved with its exact pose from the Scene file above and drawn in every view "
         "with the path of the last second. A solid line in the same colour shows the route the object "
         "has travelled since the start frame (the centre of its box at floor level).")
-    st.caption("The Convert button in the preview will run the MV-Kubric conversion in a later phase.")
 
 
 # --------------------------------------------------------------------------- page
@@ -547,9 +632,29 @@ body.mvk-resize-xy-active * { cursor: nwse-resize !important; }
 HIDE_VIEWER = "<style>.st-key-mvk_viewer_body { display: none !important; }</style>"
 
 
+def changed_modules() -> list[str]:
+    """Helper modules whose file changed after the server loaded them. Streamlit runs the newest
+    app.py on every interaction but keeps the helper modules it loaded at start-up, so new page code
+    could call functions the loaded modules do not have yet: the app has to be restarted."""
+    names = []
+    for module in (pv, gtm, cv, jobs, pv.frame_decoder):
+        try:
+            if getattr(module, "SOURCE_MTIME", None) != os.path.getmtime(module.__file__):
+                names.append(Path(module.__file__).name)
+        except OSError:
+            pass
+    return names
+
+
 def main() -> None:
     st.set_page_config(page_title="MV dataset viewer", page_icon=":material/view_module:", layout="wide")
     ss = st.session_state
+    changed = changed_modules()
+    if changed:
+        st.error(f"The app's code was updated after the app was started ({', '.join(changed)}), so it has to be "
+                 "restarted: in the terminal where it runs, press Ctrl+C, run `~/mvkubric_app/run.sh` again, then "
+                 "reload this page.", icon=":material/restart_alt:")
+        return
     if "folder" not in ss:
         ss.folder = DEFAULT_FOLDER if os.path.isdir(DEFAULT_FOLDER) else ""
 
@@ -594,9 +699,10 @@ def main() -> None:
             if scene_key(ds) not in ss:            # scene file for exact object poses (side panel)
                 ss[scene_key(ds)] = gtm.remembered_scene(ds.root)
             gtm.use_scene(ds, clean_path(ss[scene_key(ds)]))
+            shown = previewed(ds, request) if preview_on else None
 
-            # Cameras picker (drawn below): all cameras until the user chooses otherwise.
-            cam_key = remembered(camera_key(ds), list(ds.views))
+            # Cameras picker (drawn below): none until the user chooses (recordings can have 100+ cameras).
+            cam_key = remembered(camera_key(ds), [])
             ss[cam_key] = [name for name in ss[cam_key] if name in ds.views]
             cameras = chosen_cameras(ds)
 
@@ -617,7 +723,8 @@ def main() -> None:
                                help="Only these cameras are shown here, carried into the preview and converted.")
             keep(cam_key)
             if not cameras:
-                st.info("Choose at least one camera to show.")
+                st.info(f"This recording has {len(ds.views)} cameras. Choose the ones to show in the Cameras "
+                        "field above (type part of a name to filter the list).")
             else:
                 if rows * cols < len(cameras):
                     st.caption(f":orange[The grid has {rows * cols} tiles for {len(cameras)} cameras. "
@@ -625,7 +732,7 @@ def main() -> None:
                 viewer(ds, rows, cols, preview_on, cameras)
 
         if preview_on:
-            preview_body(ds, request)
+            preview_body(shown, request, ds)
 
     if convert_box is not None:
         with convert_box:
@@ -633,7 +740,17 @@ def main() -> None:
             conversion_pane(ss.convert_job)
 
     with side:
-        dataset_info(ds)
+        dataset_info(ds, shown)
         controls_help()
+
+
+def previewed(ds: pv.Dataset, request: dict) -> pv.Dataset:
+    """The recording restricted to the cameras on the preview's tiles and the frames they all have:
+    the player, the ground truth and the conversion use only these."""
+    shown = pv.subset(ds, [name for name in request["tiles"] if name])
+    pv.register(shown)
+    gtm.use_scene(shown, clean_path(st.session_state[scene_key(ds)]))
+    return shown
+
 
 main()

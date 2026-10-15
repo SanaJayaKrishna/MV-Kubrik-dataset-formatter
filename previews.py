@@ -20,7 +20,7 @@ import re
 import threading
 from collections import OrderedDict
 from concurrent.futures import Future, ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PIL import Image
@@ -28,6 +28,8 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 import frame_decoder
+
+SOURCE_MTIME = os.path.getmtime(__file__)   # app.py compares it with the file: changed code needs a restart
 
 ROUTE_PREFIX = "/mvk"
 ROUTES_ENV = "MVK_PREVIEW_ROUTES"   # set by serve.py when the routes are mounted
@@ -115,6 +117,24 @@ def index_dataset(root: str, signature: tuple) -> Dataset:
     return Dataset(ds_id, root, tuple(views), tuple(frames), timeline, size,
                    tuple(_name_pattern(f) for f in frames),
                    tuple(os.path.dirname(rgb) for _name, rgb, _mtime in signature))
+
+
+def subset(ds: Dataset, views) -> Dataset:
+    """The recording restricted to some of its cameras (kept in the dataset's order) and to the frames
+    all of them have, with its own id, so its ground truth is read from and cached for those cameras
+    only. A converted scene needs every frame in every view, and cameras recorded in different runs can
+    end at different frames. Returns ds itself when nothing is left out."""
+    names = set(views)
+    keep = [i for i, name in enumerate(ds.views) if name in names]
+    common = set.intersection(*(set(ds.frames[i]) for i in keep)) if keep else set()
+    timeline = tuple(f for f in ds.timeline if f in common)
+    if len(keep) == len(ds.views) and len(timeline) == len(ds.timeline):
+        return ds
+    chosen = tuple(ds.views[i] for i in keep)
+    return replace(ds, id=hashlib.sha1(f"{ds.id}|{chosen}".encode()).hexdigest()[:12], views=chosen,
+                   frames=tuple(ds.frames[i] for i in keep), timeline=timeline,
+                   name_patterns=tuple(ds.name_patterns[i] for i in keep),
+                   view_paths=tuple(ds.view_paths[i] for i in keep))
 
 
 _registry: OrderedDict[str, Dataset] = OrderedDict()

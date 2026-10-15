@@ -4,7 +4,7 @@ The output follows the generator that made MV-Kubric (ethz-vlg/kubric, branch
 multiview-point-tracking, challenges/point_tracking_3d/worker.py) and the loader that reads it
 (ethz-vlg/mvtracker, mvtracker/datasets/kubric_multiview_dataset.py). One scene per run:
 
-    <dataset>/mv_kubric/<n>/
+    <output folder>/<n>/             (output folder: --output, default <dataset>/mv_kubric)
         cameras.npz                  camera_positions (V, 3), lookat_positions (V, 3)
         tracked_objects.json         {"names": [...], "ids": [...]}; "dome" = the static background
         tracks_3d.npz                tracks_3d (T, N, 3): world positions of N surface points
@@ -32,7 +32,8 @@ and each object's true 3D box.
 
 Run by app.py in a separate process:
     python converter.py --dataset <folder> --start <frame> --fps <n> [--seconds <x>]
-                        [--scene-file <usd>] [--view <name>]... --progress <file.json> [--parent-pid <pid>]
+                        [--scene-file <usd>] [--view <name>]... [--output <folder>]
+                        --progress <file.json> [--parent-pid <pid>]
     (--view, repeatable: convert only these cameras, in the dataset's order; default all)
 """
 
@@ -40,10 +41,10 @@ from __future__ import annotations
 
 import argparse
 import colorsys
-import dataclasses
 import json
 import math
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -59,7 +60,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import groundtruth as gtm  # noqa: E402
 import previews as pv  # noqa: E402
 
-OUTPUT_DIR = "mv_kubric"       # created inside the dataset folder
+SOURCE_MTIME = os.path.getmtime(__file__)   # app.py compares it with the file: changed code needs a restart
+
+OUTPUT_DIR = "mv_kubric"       # default output folder, inside the dataset folder
+UNFINISHED = ".unfinished"     # marker inside a scene folder while it is being written
 N_POINTS = 18000               # tracked points per scene, as in MV-Kubric
 BACKGROUND_SHARE = 0.75        # MV-Kubric puts 59-89 % (mean 75 %) of its points on the background
 VOXEL_BACKGROUND_M = 0.05      # depth points are thinned to one per voxel, so that density follows
@@ -176,6 +180,21 @@ def clip_frames(timeline, start: int, fps: int, seconds: float | None) -> list[i
     return frames
 
 
+def missing_inputs(ds: pv.Dataset, frames: list[int]) -> list[str]:
+    """Per camera, the clip frames without depth or camera parameters (images are covered by the
+    dataset's timeline), as readable text; empty when nothing is missing."""
+    problems = []
+    for name, view_dir in zip(ds.views, ds.view_paths):
+        no_depth = [gtm._depth_file(view_dir, f) is None for f in frames]
+        no_camera = [not os.path.exists(os.path.join(view_dir, gtm.CAMERA_DIR, f"camera_params_{f:04d}.json"))
+                     for f in frames]
+        for what, lacking in (("depth (" + " or ".join(gtm.DEPTH_DIRS) + ")", no_depth),
+                              ("camera parameters (camera_params)", no_camera)):
+            if any(lacking):
+                problems.append(f"{name} has no {what} for frames {clip_ranges(frames, lacking)}")
+    return problems
+
+
 def fill_pose_gaps(transforms: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """(T, 4, 4) object->world poses with NaN in frames where no camera reported the object's 3D box
     (poses taken from the boxes). Returns the poses with those frames filled - rotation held from the
@@ -209,6 +228,21 @@ def frame_ranges(frames: list[int]) -> str:
     if start is not None:
         out.append(f"{start}-{prev}" if prev != start else str(start))
     return ", ".join(out)
+
+
+def clip_ranges(frames: list[int], flags) -> str:
+    """The clip frames where flags is true, as ranges of frames that follow each other in the clip
+    (at 15 fps 5282, 5284, ..., 5298 is one range: '5282-5298')."""
+    runs, run = [], []
+    for frame, on in zip(frames, flags):
+        if on:
+            run.append(frame)
+        elif run:
+            runs.append(run)
+            run = []
+    if run:
+        runs.append(run)
+    return ", ".join(f"{r[0]}-{r[-1]}" if len(r) > 1 else str(r[0]) for r in runs)
 
 
 def quaternion_wxyz(r: np.ndarray) -> np.ndarray:
@@ -355,30 +389,49 @@ def video_writer(path: Path, fps: int):
 
 # --------------------------------------------------------------------------- output folder
 
-def make_output_root(dataset_root: str, progress: Progress) -> Path:
-    """<dataset>/mv_kubric; if the folder belongs to the Isaac Sim container's user, the folder
-    is created through that container (docker exec as root) and handed to this user."""
-    out = Path(dataset_root) / OUTPUT_DIR
+def default_output(dataset_root: str) -> str:
+    return os.path.join(dataset_root, OUTPUT_DIR)
+
+
+def make_output_root(out: Path, progress: Progress) -> Path:
+    """The folder that receives the scene folders, created if needed. Folders this user cannot create
+    (inside the Isaac Sim workspace, which belongs to the container's user) are created through the
+    container that mounts them (docker exec as root) and handed to this user; existing folders are
+    never changed."""
+    if out.exists() and not out.is_dir():
+        raise NotADirectoryError(f"{out} is a file, not a folder.")
     try:
-        out.mkdir(exist_ok=True)
-        if os.access(out, os.W_OK):
-            return out
+        out.mkdir(parents=True, exist_ok=True)
+        return out
     except PermissionError:
         pass
-    container, inside = container_path(out)
+    missing = [p for p in (out, *out.parents) if not p.exists()][::-1]      # the folders to create, outermost first
+    container = _container_mkdir(missing)
+    progress.note(f"{missing[0].parent} belongs to the Isaac Sim container's user, so "
+                  f"{', '.join(str(p) for p in missing)} {'was' if len(missing) == 1 else 'were'} created through "
+                  f"the '{container}' container and given to this user (nothing else was changed).")
+    return out
+
+
+def _container_mkdir(folders: list[Path]) -> str:
+    """Create new folders (outermost first) through the Docker container that mounts them and give them
+    to this user. Fails if one of them exists (it is never taken over). Returns the container's name."""
+    container, inside = container_path(folders[0].parent)
     if container is None:
         raise PermissionError(
-            f"Cannot write to {dataset_root}, and no running Docker container mounts it. Make the folder "
-            f"writable for this user, for example:  sudo mkdir {out} && sudo chown {os.getuid()}:{os.getgid()} {out}")
-    cmd = ["docker", "exec", "-u", "root", container, "sh", "-c",
-           f'mkdir -p "{inside}" && chown {os.getuid()}:{os.getgid()} "{inside}"']
-    run = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if run.returncode != 0 or not os.access(out, os.W_OK):
-        raise PermissionError(f"Could not create {out} through the '{container}' container: "
+            f"Cannot create {folders[-1]}: this user cannot write to {folders[0].parent} and no running Docker "
+            f"container mounts it. Choose another output folder, or make it writable, for example:  "
+            f"sudo mkdir -p {folders[-1]} && sudo chown {os.getuid()}:{os.getgid()} {folders[-1]}")
+    parent = folders[0].parent
+    targets = [inside + "/" + str(p.relative_to(parent)) for p in folders]
+    owner = f"{os.getuid()}:{os.getgid()}"
+    script = " && ".join(f"mkdir {shlex.quote(t)} && chown {owner} {shlex.quote(t)}" for t in targets)
+    run = subprocess.run(["docker", "exec", "-u", "root", container, "sh", "-c", script],
+                         capture_output=True, text=True, timeout=60)
+    if run.returncode != 0 or not os.access(folders[-1], os.W_OK):
+        raise PermissionError(f"Could not create {folders[-1]} through the '{container}' container: "
                               f"{(run.stderr or run.stdout).strip()}")
-    progress.note(f"The dataset folder belongs to the Isaac Sim container's user, so {OUTPUT_DIR}/ was created "
-                  f"through the '{container}' container and given to this user (only that folder was changed).")
-    return out
+    return container
 
 
 def container_path(host_path: Path) -> tuple[str | None, str | None]:
@@ -402,14 +455,31 @@ def container_path(host_path: Path) -> tuple[str | None, str | None]:
     return None, None
 
 
-def new_scene_folder(root: Path) -> Path:
-    """Next free scene number, like the reference: 1, 2, 3, ..."""
-    taken = [int(p.name) for p in root.iterdir() if p.is_dir() and p.name.isdigit()]
-    number = max(taken, default=0) + 1
+def next_scene_number(root: Path) -> int:
+    try:
+        taken = [int(p.name) for p in root.iterdir() if p.is_dir() and p.name.isdigit()]
+    except OSError:
+        taken = []
+    return max(taken, default=0) + 1
+
+
+def new_scene_folder(root: Path, progress: Progress) -> Path:
+    """Next free scene number, like the reference: 1, 2, 3, ... The folder holds a marker file until the
+    scene is complete, so that only unfinished scenes are ever removed (see remove_incomplete)."""
+    number = next_scene_number(root)
+    writable = os.access(root, os.W_OK)
     while True:
         folder = root / str(number)
         try:
-            folder.mkdir()
+            if writable:
+                folder.mkdir()
+            elif folder.exists():
+                raise FileExistsError(folder)
+            else:
+                container = _container_mkdir([folder])
+                progress.note(f"{root} belongs to the Isaac Sim container's user, so the scene folder was created "
+                              f"through the '{container}' container and given to this user (nothing else was changed).")
+            (folder / UNFINISHED).touch()
             return folder
         except FileExistsError:
             number += 1
@@ -422,18 +492,19 @@ class Scene:
 
     def __init__(self, ds: pv.Dataset, frames: list[int], fps: int, scene_file: str, views: list[str] | None = None):
         self.frames, self.fps = frames, fps
-        # Ground truth and poses come from all cameras (each camera only reports what it sees) ...
+        # Only the chosen cameras are read: images, depth and output views, and also the ground truth
+        # (3D boxes and cameras), as the preview overlay does. Each camera reports the boxes of the
+        # objects it sees, so an object none of them sees has no box (see fill_pose_gaps).
+        if views:
+            unknown = [name for name in views if name not in ds.views]
+            if unknown:
+                raise ValueError(f"Cameras not in this dataset: {', '.join(unknown)}.")
+            ds = pv.subset(ds, views)
+        self.ds = ds
         self.truth = gtm.get(ds)
         self.pose = gtm.poses(ds, scene_file)
-        # ... while images, depth and the output views come from the chosen cameras only.
-        keep = [i for i, name in enumerate(ds.views) if not views or name in views]
-        if not keep:
-            raise ValueError(f"None of the chosen cameras {views} is in this dataset ({', '.join(ds.views)}).")
-        self.camera_matrices = [self.truth.camera_matrices[i] for i in keep]
-        self.ds = dataclasses.replace(
-            ds, views=tuple(ds.views[i] for i in keep), frames=tuple(ds.frames[i] for i in keep),
-            name_patterns=tuple(ds.name_patterns[i] for i in keep), view_paths=tuple(ds.view_paths[i] for i in keep))
-        self.T, self.V = len(frames), len(keep)
+        self.camera_matrices = list(self.truth.camera_matrices)
+        self.T, self.V = len(frames), len(ds.views)
         index = {f: i for i, f in enumerate(ds.timeline)}
         self.rows = [index[f] for f in frames]
         self.objects = list(self.truth.objects)
@@ -867,10 +938,15 @@ def check_scene(out: Path, progress: Progress) -> str:
 def convert(args, progress: Progress) -> None:
     root = os.path.abspath(args.dataset)
     ds = pv.index_dataset(root, pv.folder_signature(Path(root)))
+    unknown = [name for name in args.view or [] if name not in ds.views]
+    if unknown:
+        raise ValueError(f"Cameras not in this dataset: {', '.join(unknown)}.")
+    ds = pv.subset(ds, args.view or ds.views)          # the chosen cameras and the frames they all have
 
-    progress.start("folder", f"{root}/{OUTPUT_DIR}")
-    out_root = make_output_root(root, progress)
-    out = new_scene_folder(out_root)
+    out_root = Path(os.path.abspath(os.path.expanduser(args.output or default_output(root))))
+    progress.start("folder", str(out_root))
+    make_output_root(out_root, progress)
+    out = new_scene_folder(out_root, progress)
     progress.set(output=str(out))
     progress.finish("folder", str(out))
 
@@ -878,6 +954,10 @@ def convert(args, progress: Progress) -> None:
     frames = clip_frames(ds.timeline, args.start, args.fps, args.seconds)
     if len(frames) < 2:
         raise ValueError("The clip has fewer than 2 frames; choose an earlier start frame or more seconds.")
+    missing = missing_inputs(ds, frames)
+    if missing:
+        raise ValueError("Every view needs every frame of the clip, but " + "; ".join(missing)
+                         + ". Choose a clip without these frames, or other cameras.")
     scene = Scene(ds, frames, args.fps, args.scene_file or "", args.view)
     if scene.pose.source != "scene":
         progress.note("No exact poses from a scene file: object motion comes from the recorded 3D boxes, "
@@ -886,7 +966,7 @@ def convert(args, progress: Progress) -> None:
     for name, known in zip(scene.object_names, scene.pose_known):
         missing = [f for f, ok in zip(frames, known) if not ok]
         if missing and known.any():
-            progress.note(f"{name}: no camera reported its 3D box in frames {frame_ranges(missing)}, so its position "
+            progress.note(f"{name}: no camera reported its 3D box in frames {clip_ranges(frames, ~known)}, so its position "
                           "there is interpolated between the frames around them; its points count as hidden there.")
         elif missing:
             progress.note(f"{name}: no camera sees it anywhere in the clip (no 3D box in any of its frames), "
@@ -942,6 +1022,7 @@ def convert(args, progress: Progress) -> None:
 
     write_videos(scene, out, tracks_3d, track_ids, views_2d, progress)
     check = check_scene(out, progress)
+    (out / UNFINISHED).unlink(missing_ok=True)          # complete: the scene folder is exactly the reference layout
     objects = [n for n, oid in zip(scene.object_names, scene.object_ids) if (track_ids == oid).any()]
     progress.set(status="done", finished=time.time(), summary={
         "scene": out.name, "frames": len(frames), "views": scene.V, "tracks": int(tracks_3d.shape[1]),
@@ -958,6 +1039,7 @@ def main() -> None:
     ap.add_argument("--seconds", type=float, default=None)
     ap.add_argument("--scene-file", default="")
     ap.add_argument("--view", action="append", default=None, help="camera (view folder) to convert; repeatable")
+    ap.add_argument("--output", default="", help="folder that receives the scene folder (default <dataset>/mv_kubric)")
     ap.add_argument("--progress", required=True)
     ap.add_argument("--parent-pid", type=int, default=None)
     args = ap.parse_args()
@@ -976,14 +1058,18 @@ def main() -> None:
 
 
 def remove_incomplete(output: str | None) -> bool:
-    """Delete a half-written scene folder (it would break the MVTracker loader)."""
-    if not output or not os.path.isdir(output) or not Path(output).name.isdigit():
-        return False
-    if Path(output).parent.name != OUTPUT_DIR:
+    """Delete a half-written scene folder (it would break the MVTracker loader). Only a numbered folder
+    that still holds the converter's marker is touched, wherever the output folder is."""
+    if not output or not Path(output).name.isdigit() or not os.path.isfile(os.path.join(output, UNFINISHED)):
         return False
     import shutil
     shutil.rmtree(output, ignore_errors=True)
-    return True
+    if os.path.isdir(output):         # emptied, but its parent belongs to the container's user
+        container, inside = container_path(Path(output))
+        if container is not None and not os.listdir(output):
+            subprocess.run(["docker", "exec", "-u", "root", container, "rmdir", inside],
+                           capture_output=True, text=True, timeout=60)
+    return not os.path.isdir(output)
 
 
 if __name__ == "__main__":

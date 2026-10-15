@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import re
@@ -34,6 +35,7 @@ import sys
 import tempfile
 import threading
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,10 +45,13 @@ from starlette.responses import JSONResponse, Response
 
 import previews as pv
 
+SOURCE_MTIME = os.path.getmtime(__file__)   # app.py compares it with the file: changed code needs a restart
+
 BOX_DIR, CAMERA_DIR = "bounding_box_3d", "camera_params"
 DEPTH_DIRS = ("distance_to_camera", "distance_to_image_plane")   # either depth annotator works
 BOX_RE = re.compile(r"^bounding_box_3d_(\d+)\.npy$")
 MAX_CACHED = 4
+READ_THREADS = 8           # views read in parallel when loading the ground truth
 POINTS_PER_OBJECT = 48     # tracked points per object
 SAMPLE_FRAMES = 6          # frames whose depth is used to find each object's surface
 VOXEL_M = 0.04             # merge depth points closer than this before choosing the tracked points
@@ -108,34 +113,103 @@ def _read_json(path: str, default):
         return default
 
 
-def load(ds: pv.Dataset) -> GroundTruth:
-    wanted = set(ds.timeline)
-    found: dict[str, tuple[str, dict[int, np.ndarray]]] = {}
-    for view_dir in ds.view_paths:
-        folder = os.path.join(view_dir, BOX_DIR)
+class _FileReader:
+    """Reads one view's thousands of small per-frame files quickly. Most of them repeat byte for
+    byte from frame to frame (box labels, prim paths, a camera that does not move), so each
+    distinct content is parsed only once; .npy arrays are read without re-parsing their header."""
+
+    def __init__(self) -> None:
+        self._json: dict[bytes, object] = {}
+        self._npy: dict[bytes, tuple] = {}
+
+    @staticmethod
+    def raw(path: str) -> bytes | None:
         try:
-            names = os.listdir(folder)
+            with open(path, "rb") as f:
+                return f.read()
         except OSError:
-            continue
-        for name in names:
-            m = BOX_RE.match(name)
-            if not m or int(m.group(1)) not in wanted:
-                continue
-            frame, stem = int(m.group(1)), m.group(1)
+            return None
+
+    def json(self, path: str, default):
+        return self.parse(self.raw(path), default)
+
+    def parse(self, content: bytes | None, default):
+        if content is None:
+            return default
+        if content not in self._json:
             try:
-                rows = np.load(os.path.join(folder, name))
-            except (OSError, ValueError):
-                continue
-            if len(rows) == 0:
-                continue
-            labels = _read_json(os.path.join(folder, f"bounding_box_3d_labels_{stem}.json"), {})
-            paths = _read_json(os.path.join(folder, f"bounding_box_3d_prim_paths_{stem}.json"), [])
-            corners = box_corners(rows)
-            for i, row in enumerate(rows):
-                sid = str(int(row["semanticId"]))
-                path = paths[i] if i < len(paths) else f"object_{sid}"
-                _label, per_frame = found.setdefault(path, (label_of(labels.get(sid, sid)), {}))
-                per_frame.setdefault(frame, (corners[i], row))
+                self._json[content] = json.loads(content)
+            except ValueError:
+                self._json[content] = default
+        return self._json[content]
+
+    def npy(self, path: str) -> np.ndarray | None:
+        raw = self.raw(path)
+        if raw is None or raw[:6] != b"\x93NUMPY" or len(raw) < 12:
+            return None
+        start = 10 + int.from_bytes(raw[8:10], "little") if raw[6] == 1 else 12 + int.from_bytes(raw[8:12], "little")
+        header = raw[:start]
+        if header not in self._npy:
+            fp = io.BytesIO(raw)
+            version = np.lib.format.read_magic(fp)
+            read = np.lib.format.read_array_header_1_0 if version == (1, 0) else np.lib.format.read_array_header_2_0
+            try:
+                shape, fortran, dtype = read(fp)
+            except ValueError:
+                return None
+            self._npy[header] = (shape, fortran, dtype)
+        shape, fortran, dtype = self._npy[header]
+        if dtype.hasobject:
+            return None
+        count = int(np.prod(shape))
+        if len(raw) < start + count * dtype.itemsize:
+            return None
+        return np.frombuffer(raw, dtype, count, start).reshape(shape, order="F" if fortran else "C")
+
+
+def _view_boxes(view_dir: str, wanted: set[int], reader: _FileReader) -> dict[str, tuple[str, dict]]:
+    """One view's boxes: prim path -> (label, {frame: (world corners, recorded row)})."""
+    folder = os.path.join(view_dir, BOX_DIR)
+    found: dict[str, tuple[str, dict]] = {}
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return found
+    for name in names:
+        m = BOX_RE.match(name)
+        if not m or int(m.group(1)) not in wanted:
+            continue
+        frame, stem = int(m.group(1)), m.group(1)
+        rows = reader.npy(os.path.join(folder, name))
+        if rows is None or len(rows) == 0:
+            continue
+        labels = reader.json(os.path.join(folder, f"bounding_box_3d_labels_{stem}.json"), {})
+        paths = reader.json(os.path.join(folder, f"bounding_box_3d_prim_paths_{stem}.json"), [])
+        corners = box_corners(rows)
+        for i, row in enumerate(rows):
+            sid = str(int(row["semanticId"]))
+            path = paths[i] if i < len(paths) else f"object_{sid}"
+            found.setdefault(path, (label_of(labels.get(sid, sid)), {}))[1][frame] = (corners[i], row)
+    return found
+
+
+def _read_view(view_dir: str, wanted: set[int], timeline) -> tuple[dict, list]:
+    reader = _FileReader()
+    return _view_boxes(view_dir, wanted, reader), _cameras(view_dir, timeline, reader)
+
+
+def load(ds: pv.Dataset) -> GroundTruth:
+    """Boxes and cameras of the dataset's views (only those: a subset of the cameras reads only theirs)."""
+    wanted = set(ds.timeline)
+    with ThreadPoolExecutor(max_workers=max(1, min(READ_THREADS, len(ds.view_paths)))) as pool:
+        per_view = list(pool.map(lambda view_dir: _read_view(view_dir, wanted, ds.timeline), ds.view_paths))
+    # In every frame the first view that reports an object supplies its box.
+    found: dict[str, tuple[str, dict[int, tuple]]] = {}
+    for boxes, _cams in per_view:
+        for path, (label, frames) in boxes.items():
+            merged = found.setdefault(path, (label, {}))[1]
+            for frame, item in frames.items():
+                merged.setdefault(frame, item)
     objects = []
     for path in sorted(found, key=lambda p: (found[p][0].lower(), p)):
         label, per_frame = found[path]
@@ -146,17 +220,24 @@ def load(ds: pv.Dataset) -> GroundTruth:
             np.array([first["x_min"], first["y_min"], first["z_min"]], dtype=np.float64),
             np.array([first["x_max"], first["y_max"], first["z_max"]], dtype=np.float64),
             first["transform"].astype(np.float64)))
-    matrices = tuple(_cameras(view_dir, ds.timeline) for view_dir in ds.view_paths)
+    matrices = tuple(cams for _boxes, cams in per_view)
     clip = tuple([[frame, (view @ proj).ravel().tolist()] for frame, view, proj, _w, _h in cams] for cams in matrices)
     return GroundTruth(tuple(objects), clip, matrices)
 
 
-def _cameras(view_dir: str, timeline) -> list:
+def _cameras(view_dir: str, timeline, reader: _FileReader | None = None) -> list:
     """Per view: (first frame, view, projection, width, height) wherever the camera changes.
     Row-vector convention: clip = [x y z 1] @ view @ projection."""
+    reader = reader or _FileReader()
     out: list = []
+    previous = None
     for frame in timeline:
-        raw = _read_json(os.path.join(view_dir, CAMERA_DIR, f"camera_params_{frame:04d}.json"), None)
+        path = os.path.join(view_dir, CAMERA_DIR, f"camera_params_{frame:04d}.json")
+        content = reader.raw(path)
+        if content is None or content == previous:     # a camera that did not move: same file content
+            continue
+        previous = content
+        raw = reader.parse(content, None)
         if raw is None:
             continue
         view = np.array(raw["cameraViewTransform"], dtype=np.float64).reshape(4, 4)

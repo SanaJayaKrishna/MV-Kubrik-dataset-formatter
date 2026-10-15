@@ -618,7 +618,8 @@ export default function (component) {
   if (!data || !data.runs || !data.runs.length) return;
   let root = parentElement.querySelector(".mvk-root");
   if (!root) root = el("div", "mvk-root", parentElement);
-  const { gt, ...base } = data;            // the overlay changes without restarting playback
+  // The overlay and app.py's copy of FPS / Seconds change without restarting playback.
+  const { gt, reported, ...base } = data;
   const config = JSON.stringify(base);
   if (!root.__player || root.__config !== config) {
     if (root.__player) root.__player.destroy();
@@ -626,8 +627,14 @@ export default function (component) {
     root.__config = config;
     root.__gt = undefined;
   }
-  root.__player.setStateValue = setStateValue;
-  root.__player.setTriggerValue = setTriggerValue;
+  const p = root.__player;
+  p.setStateValue = setStateValue;
+  p.setTriggerValue = setTriggerValue;
+  // The player starts with the FPS / Seconds last used in this browser, while app.py starts from its
+  // defaults (and forgets its values while the preview is closed). Whenever app.py's copy differs, send
+  // the player's values, so that Convert converts the clip set up here.
+  if (reported && reported.fps !== p.fps) setStateValue("fps", p.fps);
+  if (reported && (reported.seconds ?? null) !== p.seconds) setStateValue("seconds", p.seconds);
   const gtConfig = JSON.stringify(gt || null);
   if (root.__gt !== gtConfig) {
     root.__gt = gtConfig;
