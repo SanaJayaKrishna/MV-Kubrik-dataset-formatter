@@ -35,11 +35,14 @@ Run by app.py in a separate process:
                         [--scene-file <usd>] [--view <name>]... [--output <folder>]
                         --progress <file.json> [--parent-pid <pid>]
     (--view, repeatable: convert only these cameras, in the dataset's order; default all)
+    --auto: Auto Mode, the whole recording as consecutive clips of --seconds at --fps (a short last
+    clip holds its last frame), one scene per clip in <output>/AutoConverted/_<date-time>/1 ... X
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import colorsys
 import json
 import math
@@ -64,6 +67,7 @@ SOURCE_MTIME = os.path.getmtime(__file__)   # app.py compares it with the file: 
 
 DEFAULT_OUTPUT = "/home/jk/mnt_dataset_mig1/mvkds"   # default folder for the scenes, on the mig1 share
 UNFINISHED = ".unfinished"     # marker inside a scene folder while it is being written
+AUTO_DIR = "AutoConverted"     # Auto Mode: <output>/AutoConverted/_<date-time>/<1..X>, one scene per clip
 N_POINTS = 18000               # tracked points per scene, as in MV-Kubric
 BACKGROUND_SHARE = 0.75        # MV-Kubric puts 59-89 % (mean 75 %) of its points on the background
 VOXEL_BACKGROUND_M = 0.05      # depth points are thinned to one per voxel, so that density follows
@@ -134,9 +138,36 @@ class Progress:
                 s["detail"] = detail
         self.write(force=True)
 
-    def note(self, text):
+    def note(self, text, general=False):
+        """In an Auto Mode batch a note belongs to the scene being converted, unless it is general."""
         with self.lock:
-            self.state["notes"].append(text)
+            batch = self.state.get("batch")
+            if batch and not general and batch.get("current") is not None:
+                batch["scenes"][batch["current"]]["notes"].append(text)
+            else:
+                self.state["notes"].append(text)
+        self.write(force=True)
+
+    def reset_steps(self):
+        """Next scene of an Auto Mode batch: every step pending again."""
+        with self.lock:
+            for s in self.state["steps"]:
+                s.update(status="pending", detail="", done=0, total=0)
+        self.write(force=True)
+
+    def scene(self, i, status, **fields):
+        """Auto Mode: scene i is now running, done or failed."""
+        with self.lock:
+            batch = self.state["batch"]
+            entry = batch["scenes"][i]
+            entry.update(status=status, **fields)
+            if status == "running":
+                batch["current"] = i
+                entry["started"] = time.time()
+            else:
+                entry["finished"] = time.time()
+                batch["done"] = sum(1 for e in batch["scenes"] if e["status"] == "done")
+                batch["failed"] = sum(1 for e in batch["scenes"] if e["status"] == "failed")
         self.write(force=True)
 
     def set(self, **kwargs):
@@ -164,20 +195,62 @@ class Progress:
 
 # --------------------------------------------------------------------------- small helpers
 
+def shown_offset(k: int, fps: int) -> int:
+    """Recorded-frame offset of shown frame k at `fps`: round(k * 30 / fps), halves rounded up like
+    the preview player (JavaScript's Math.round), so both pick the same frames."""
+    return math.floor(k * SOURCE_FPS / fps + 0.5)
+
+
+def nearest_frame(timeline, frame: int) -> int:
+    i = bisect.bisect_left(timeline, frame)
+    return min(timeline[max(0, i - 1):i + 1], key=lambda f: abs(f - frame))
+
+
 def clip_frames(timeline, start: int, fps: int, seconds: float | None) -> list[int]:
     """Recorded frames shown by the preview: start + round(k * 30 / fps), within the clip."""
     last = timeline[-1]
     limit = math.ceil(seconds * SOURCE_FPS - 1e-9) - 1 if seconds else math.inf
     frames, k = [], 0
     while True:
-        offset = round(k * SOURCE_FPS / fps)
+        offset = shown_offset(k, fps)
         if start + offset > last or offset > limit:
             break
-        frame = timeline[int(np.argmin(np.abs(np.asarray(timeline) - (start + offset))))]
+        frame = nearest_frame(timeline, start + offset)
         if not frames or frame != frames[-1]:
             frames.append(frame)
         k += 1
     return frames
+
+
+def auto_splits(timeline, fps: int, seconds: float | None) -> list[dict]:
+    """Auto Mode: the whole recording from its first frame as consecutive clips of `seconds` (one clip
+    of everything when empty), each shown at `fps` like the preview (output frame k = clip start +
+    round(k * 30 / fps)). A last clip that runs past the end of the recording holds its last frame
+    until it is as long as the others. Mirrors computeSplits() in preview.js.
+    Returns [{"start": first recorded frame, "frames": [frame per output frame], "real": frames before
+    the held ones}, ...]."""
+    first, last = timeline[0], timeline[-1]
+    span = math.ceil(seconds * SOURCE_FPS - 1e-9) if seconds else None    # recorded frames per clip
+    splits, start = [], first
+    while start <= last:
+        frames, real, k = [], 0, 0
+        while True:
+            offset = shown_offset(k, fps)
+            if span is not None and offset > span - 1:
+                break
+            if start + offset > last:
+                if span is None:
+                    break
+                frames.append(frames[-1])                       # hold the last frame
+            else:
+                frames.append(nearest_frame(timeline, start + offset))
+                real += 1
+            k += 1
+        splits.append({"start": start, "frames": frames, "real": real})
+        if span is None:
+            break
+        start += span
+    return splits
 
 
 def missing_inputs(ds: pv.Dataset, frames: list[int]) -> list[str]:
@@ -940,37 +1013,109 @@ def check_scene(out: Path, progress: Progress) -> str:
 
 # --------------------------------------------------------------------------- main
 
-def convert(args, progress: Progress) -> None:
+def open_dataset(args) -> tuple[str, pv.Dataset]:
+    """The recording restricted to the chosen cameras (--view) and the frames they all have."""
     root = os.path.abspath(args.dataset)
     ds = pv.index_dataset(root, pv.folder_signature(Path(root)))
     unknown = [name for name in args.view or [] if name not in ds.views]
     if unknown:
         raise ValueError(f"Cameras not in this dataset: {', '.join(unknown)}.")
-    ds = pv.subset(ds, args.view or ds.views)          # the chosen cameras and the frames they all have
+    return root, pv.subset(ds, args.view or ds.views)
 
+
+def output_root(args) -> Path:
     out_root = Path(os.path.abspath(os.path.expanduser(args.output or DEFAULT_OUTPUT)))
     problem = default_output_problem(str(out_root))
     if problem:
         raise FileNotFoundError(problem)
+    return out_root
+
+
+def convert(args, progress: Progress) -> None:
+    """One clip (start frame, FPS, Seconds) -> the next numbered scene in the output folder."""
+    root, ds = open_dataset(args)
+    out_root = output_root(args)
     progress.start("folder", str(out_root))
     make_output_root(out_root, progress)
     out = new_scene_folder(out_root, progress)
     progress.set(output=str(out))
     progress.finish("folder", str(out))
-
-    progress.start("clip", "Reading cameras and poses")
     frames = clip_frames(ds.timeline, args.start, args.fps, args.seconds)
+    summary = convert_scene(ds, root, frames, args.fps, args.scene_file or "", out, progress)
+    progress.set(status="done", finished=time.time(), summary=summary)
+
+
+def convert_auto(args, progress: Progress) -> None:
+    """Auto Mode: the whole recording as consecutive clips (see auto_splits), each its own scene in
+    <output>/AutoConverted/_<date-time>/<1..X>. A clip that fails is reported and skipped (its unfinished
+    folder removed); the batch stops after 3 failures in a row."""
+    root, ds = open_dataset(args)
+    splits = auto_splits(ds.timeline, args.fps, args.seconds)
+    if len(splits[0]["frames"]) < 2:
+        raise ValueError("Each clip needs at least 2 frames: give more seconds or a higher FPS.")
+    out_root = output_root(args)
+    progress.start("folder", str(out_root))
+    make_output_root(out_root, progress)
+    batch_root = out_root / AUTO_DIR / time.strftime("_%Y-%m-%d_%H-%M-%S")
+    make_output_root(batch_root, progress)
+    progress.set(output=str(batch_root), batch={
+        "root": str(batch_root), "total": len(splits), "fps": args.fps, "seconds": args.seconds,
+        "frames_per_clip": len(splits[0]["frames"]), "current": None, "done": 0, "failed": 0,
+        "scenes": [{"number": i + 1, "first": sp["frames"][0], "last": sp["frames"][-1], "frames": len(sp["frames"]),
+                    "held": len(sp["frames"]) - sp["real"], "status": "pending", "notes": [], "error": None,
+                    "started": None, "finished": None} for i, sp in enumerate(splits)],
+    })
+    progress.finish("folder", str(batch_root))
+    failures_in_a_row = 0
+    for i, split in enumerate(splits):
+        out = batch_root / str(i + 1)
+        progress.scene(i, "running")
+        try:
+            progress.reset_steps()
+            progress.start("folder", str(out))
+            out.mkdir()
+            (out / UNFINISHED).touch()
+            progress.set(output=str(out))
+            progress.finish("folder", str(out))
+            summary = convert_scene(ds, root, split["frames"], args.fps, args.scene_file or "", out, progress,
+                                    general_notes=i == 0,
+                                    extra_flags={"auto_clip": i + 1, "auto_clips": len(splits),
+                                                 "held_frames": len(split["frames"]) - split["real"]})
+            progress.scene(i, "done", objects=summary["objects"])
+            failures_in_a_row = 0
+        except Exception as exc:  # noqa: BLE001 - reported per scene, the batch goes on
+            remove_incomplete(str(out))
+            progress.scene(i, "failed", error=f"{type(exc).__name__}: {exc}")
+            failures_in_a_row += 1
+            if failures_in_a_row >= 3:
+                raise RuntimeError(f"3 clips in a row failed (the last one: {type(exc).__name__}: {exc}); "
+                                   "the batch was stopped.") from exc
+    batch = progress.state["batch"]
+    progress.set(output=str(batch_root), finished=time.time(),
+                 status="done" if batch["done"] else "failed",
+                 error=None if batch["done"] else "No clip could be converted.",
+                 summary={"auto": True, "root": str(batch_root), "scenes": batch["done"], "failed": batch["failed"],
+                          "total": len(splits), "frames": batch["frames_per_clip"], "fps": args.fps,
+                          "views": len(ds.views)})
+
+
+def convert_scene(ds: pv.Dataset, root: str, frames: list[int], fps: int, scene_file: str, out: Path,
+                  progress: Progress, general_notes: bool = True, extra_flags: dict | None = None) -> dict:
+    """One clip -> one finished MV-Kubric scene in `out` (an existing folder holding the unfinished
+    marker). Frames may repeat (Auto Mode holds the last frame of a short last clip). General notes
+    (pose source, masks, clip length) are left out for all but the first scene of a batch."""
+    progress.start("clip", "Reading cameras and poses")
     if len(frames) < 2:
         raise ValueError("The clip has fewer than 2 frames; choose an earlier start frame or more seconds.")
-    missing = missing_inputs(ds, frames)
+    missing = missing_inputs(ds, sorted(set(frames)))
     if missing:
         raise ValueError("Every view needs every frame of the clip, but " + "; ".join(missing)
                          + ". Choose a clip without these frames, or other cameras.")
-    scene = Scene(ds, frames, args.fps, args.scene_file or "", args.view)
-    if scene.pose.source != "scene":
+    scene = Scene(ds, frames, fps, scene_file, list(ds.views))
+    if general_notes and scene.pose.source != "scene":
         progress.note("No exact poses from a scene file: object motion comes from the recorded 3D boxes, "
                       "which keep the first frame's orientation (objects that turn are tracked wrongly). "
-                      + (scene.pose.error or ""))
+                      + (scene.pose.error or ""), general=True)
     for name, known in zip(scene.object_names, scene.pose_known):
         missing = [f for f, ok in zip(frames, known) if not ok]
         if missing and known.any():
@@ -979,14 +1124,16 @@ def convert(args, progress: Progress) -> None:
         elif missing:
             progress.note(f"{name}: no camera sees it anywhere in the clip (no 3D box in any of its frames), "
                           "so it has no tracked points.")
-    if not all(scene.recorded_masks):
+    if general_notes and not all(scene.recorded_masks):
         progress.note("No instance_segmentation in the recording: object pixels come from the depth and each "
-                      "object's true 3D box. Record instance_segmentation for exact masks.")
-    if len(frames) < 24:
+                      "object's true 3D box. Record instance_segmentation for exact masks.", general=True)
+    if general_notes and len(frames) < 24:
         progress.note(f"The clip has {len(frames)} frames; MVTracker trains and evaluates on 24-frame windows "
-                      "(12 fps x 2 s in the preview gives exactly 24).")
-    progress.finish("clip", f"{len(frames)} frames ({frames[0]} to {frames[-1]}) at {args.fps} fps from "
-                            f"{scene.V} views; poses from {'the scene file' if scene.pose.source == 'scene' else 'the 3D boxes'}")
+                      "(12 fps x 2 s in the preview gives exactly 24).", general=True)
+    held = (extra_flags or {}).get("held_frames", 0)
+    progress.finish("clip", f"{len(frames)} frames ({frames[0]} to {frames[-1]}) at {fps} fps from {scene.V} views"
+                            + (f", the last {held} hold frame {frames[-1]}" if held else "")
+                            + f"; poses from {'the scene file' if scene.pose.source == 'scene' else 'the 3D boxes'}")
 
     seed = int(out.name) if out.name.isdigit() else 0
     tracks_3d, track_ids = sample_tracks(scene, N_POINTS, seed, progress)
@@ -1001,7 +1148,7 @@ def convert(args, progress: Progress) -> None:
     flags = {
         # the generator's flags, with this conversion's values (None where they do not apply)
         "backgrounds_split": None, "camera": "fixed", "floor_friction": None, "floor_restitution": None,
-        "frame_end": len(frames), "frame_rate": args.fps, "frame_start": 1, "gso_assets": None,
+        "frame_end": len(frames), "frame_rate": fps, "frame_start": 1, "gso_assets": None,
         "hdri_assets": None, "job_dir": str(out), "kubasic_assets": None, "logging_level": "INFO",
         "max_camera_movement": 0.0, "max_motion_blur": 0.0, "max_num_dynamic_objects": None,
         "max_num_static_objects": None, "min_num_dynamic_objects": None, "min_num_static_objects": None,
@@ -1010,13 +1157,14 @@ def convert(args, progress: Progress) -> None:
         "show_debug_plots": False, "step_rate": SOURCE_FPS,
         # where the scene came from
         "source": "isaac_sim", "source_dataset": root, "source_views": list(scene.ds.views),
-        "source_frames": frames, "source_fps": SOURCE_FPS, "scene_file": args.scene_file or None,
+        "source_frames": frames, "source_fps": SOURCE_FPS, "scene_file": scene_file or None,
         "pose_source": scene.pose.source,
         "segmentation_source": "instance_segmentation" if all(scene.recorded_masks) else "depth_and_3d_boxes",
+        **(extra_flags or {}),
     }
     scene_meta = {
-        "background": Path(args.scene_file).stem if args.scene_file else Path(root).name,
-        "frame_rate": args.fps, "gravity": GRAVITY, "motion_blur": 0.0, "num_frames": len(frames),
+        "background": Path(scene_file).stem if scene_file else Path(root).name,
+        "frame_rate": fps, "gravity": GRAVITY, "motion_blur": 0.0, "num_frames": len(frames),
         "resolution": [scene.W, scene.H], "seed": seed, "step_rate": SOURCE_FPS,
     }
 
@@ -1032,32 +1180,35 @@ def convert(args, progress: Progress) -> None:
     check = check_scene(out, progress)
     (out / UNFINISHED).unlink(missing_ok=True)          # complete: the scene folder is exactly the reference layout
     objects = [n for n, oid in zip(scene.object_names, scene.object_ids) if (track_ids == oid).any()]
-    progress.set(status="done", finished=time.time(), summary={
-        "scene": out.name, "frames": len(frames), "views": scene.V, "tracks": int(tracks_3d.shape[1]),
-        "objects": objects, "fps": args.fps, "first_frame": frames[0], "last_frame": frames[-1],
-        "check": check,
-    })
+    return {"scene": out.name, "frames": len(frames), "views": scene.V, "tracks": int(tracks_3d.shape[1]),
+            "objects": objects, "fps": fps, "first_frame": frames[0], "last_frame": frames[-1], "check": check}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dataset", required=True)
-    ap.add_argument("--start", type=int, required=True)
+    ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--fps", type=int, default=SOURCE_FPS)
     ap.add_argument("--seconds", type=float, default=None)
     ap.add_argument("--scene-file", default="")
     ap.add_argument("--view", action="append", default=None, help="camera (view folder) to convert; repeatable")
     ap.add_argument("--output", default="", help=f"folder that receives the scene folder (default {DEFAULT_OUTPUT})")
+    ap.add_argument("--auto", action="store_true",
+                    help="Auto Mode: the whole recording as clips of --seconds at --fps, one scene each "
+                         f"(in <output>/{AUTO_DIR}/_<date-time>/); --start is ignored")
     ap.add_argument("--progress", required=True)
     ap.add_argument("--parent-pid", type=int, default=None)
     args = ap.parse_args()
     progress = Progress(args.progress, args.parent_pid)
     try:
-        convert(args, progress)
+        (convert_auto if args.auto else convert)(args, progress)
     except Exception as exc:  # reported in the app's conversion pane
         for step in progress.state["steps"]:
             if step["status"] == "running":
                 step["status"] = "failed"
+        for scene in (progress.state.get("batch") or {}).get("scenes", []):
+            if scene["status"] == "running":
+                scene["status"] = "failed"
         error = f"{type(exc).__name__}: {exc}"
         if remove_incomplete(progress.state.get("output")):
             error += " (the incomplete scene folder was removed)"

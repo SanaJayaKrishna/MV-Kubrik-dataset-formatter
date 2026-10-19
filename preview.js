@@ -14,6 +14,13 @@
 // Play button: click = play / pause, double-click = stop and go back to the start frame.
 // Preview toggle (on): switches the pane back to the multi-view viewer.
 //
+// Auto Mode toggle (off by default): the whole recording, from its first frame, as consecutive clips
+// of Seconds each (one clip of everything when Seconds is empty), shown at FPS. A last clip that runs
+// past the end of the recording holds its last frame until it is as long as the others (the same
+// split as converter.auto_splits). A gallery under the player shows every clip in the tile
+// arrangement; Play goes through the clips one after another, a click on a clip shows that clip, and
+// app.py's Convert becomes Auto Convert (one MV-Kubric scene per clip).
+//
 // Ground truth overlay (data.gt, set by the object picker in app.py): each selected object's
 // tracked points lie on its real surface (taken from the recorded depth) and move with its
 // per-frame pose (from the scene file, or from the 3D boxes); they are projected into every view
@@ -34,6 +41,9 @@ const savedFps = new Map();   // dataset folder -> playback FPS
 const savedSeconds = new Map(); // dataset folder -> clip length in seconds (null = until the end)
 const jsonCache = new Map();  // url -> Promise<object | null>
 const GT_FORMAT = 2;          // part of the ground-truth URLs: bump when the server's reply changes
+const THUMB_W = 160;          // Auto Mode gallery: image width per tile of a clip's thumbnail
+const THUMB_GAP = 4;
+const THUMB_PARALLEL = 2;     // thumbnails loading at once (leaves connections for the player)
 
 function fetchJson(url) {
   if (!jsonCache.has(url)) {
@@ -116,10 +126,16 @@ function buildPlayer(root, data) {
 
   const legend = el("div", "mvk-legend", root);
   legend.hidden = true;
-  const bar = el("div", "mvk-nav", root);
-  const play = el("button", "mvk-btn mvk-play", bar);
+  // Control row: Auto Mode | play | FPS | Seconds | status, as separate groups.
+  const bar = el("div", "mvk-nav mvk-player-bar", root);
+  const autoGroup = el("span", "mvk-group", bar);
+  const autoToggle = makeToggle(autoGroup, "Auto Mode", false);
+  autoToggle.title = "Auto Mode: the whole recording from its first frame as clips of Seconds each, shown at FPS, " +
+    "with a gallery of all clips; Convert becomes Auto Convert (one scene per clip)";
+  const playGroup = el("span", "mvk-group", bar);
+  const play = el("button", "mvk-btn mvk-play", playGroup);
   play.title = "Click: play / pause.  Double-click: stop and go back to the start frame";
-  const fpsLabel = el("label", "mvk-label", bar);
+  const fpsLabel = el("label", "mvk-label mvk-group", bar);
   fpsLabel.append("FPS");
   const fpsInput = el("input", "mvk-input mvk-fps", fpsLabel);
   fpsInput.type = "number";
@@ -127,7 +143,7 @@ function buildPlayer(root, data) {
   fpsInput.max = String(src);
   fpsInput.step = "1";
   fpsInput.title = `Frames shown per second (1 to ${src}); playback stays real time`;
-  const secondsLabel = el("label", "mvk-label", bar);
+  const secondsLabel = el("label", "mvk-label mvk-group", bar);
   secondsLabel.append("Seconds");
   const secondsInput = el("input", "mvk-input mvk-seconds", secondsLabel);
   secondsInput.type = "number";
@@ -135,9 +151,11 @@ function buildPlayer(root, data) {
   secondsInput.step = "any";
   secondsInput.placeholder = "all";
   secondsInput.title = "How long to play, in seconds of the recording (empty: until the last frame)";
-  const status = el("span", "mvk-status mvk-player-status", bar);
+  const status = el("span", "mvk-status mvk-player-status mvk-group", bar);
   const note = el("div", "mvk-player-note", root);
   const clipNote = el("div", "mvk-player-note mvk-player-clip", root);
+  const gallery = el("div", "mvk-gallery", root);     // Auto Mode: every clip
+  gallery.hidden = true;
   const actions = el("div", "mvk-actions", root);
   const toggle = makeToggle(actions, "Preview", true);
   toggle.title = "Switch back to the multi-view viewer";
@@ -170,6 +188,10 @@ function buildPlayer(root, data) {
     setStateValue: null,
     setTriggerValue: null,
     syncTimer: 0,
+    auto: false,            // Auto Mode on
+    splits: null,           // Auto Mode: [{start, frames: [recorded frame per output frame], real}]
+    clip: 0,                // Auto Mode: clip on screen
+    pos: 0,                 // Auto Mode: output frame (within the clip) on screen
     observer: null,
     gt: { on: false, objects: [], trail: src },   // overlay settings from app.py
     cams: null,             // per view: [[first frame, world->clip matrix], ...]
@@ -185,9 +207,20 @@ function buildPlayer(root, data) {
     (view >= 0 && !missing[view].has(frame) ? url(view, frame) : null));
 
   function target(k) {      // recorded frame for output frame k, or null past the end of the clip
+    if (p.auto) {
+      const sp = p.splits[p.clip];
+      return sp && k < sp.frames.length ? sp.frames[k] : null;
+    }
     const f = p.anchor + Math.round((k * src) / p.fps);
     if (f > last || f - p.origin > clipOffset()) return null;
     return timeline[nearestIndex(timeline, f)];
+  }
+
+  function peek(j) {        // frame j places after the next one; in Auto Mode it runs on into the next clips
+    if (!p.auto) return target(p.k + j);
+    let clip = p.clip, k = p.k + j;
+    while (p.splits[clip] && k >= p.splits[clip].frames.length) { k -= p.splits[clip].frames.length; clip++; }
+    return p.splits[clip] ? p.splits[clip].frames[k] : null;
   }
 
   // ---- clip length (Seconds field)
@@ -210,6 +243,149 @@ function buildPlayer(root, data) {
   }
 
   const formatSeconds = (x) => String(Math.round(x * 100) / 100);
+
+  // ---- Auto Mode: clips of the whole recording (keep in step with converter.auto_splits)
+
+  function computeSplits() {
+    const first = timeline[0];
+    const span = p.seconds ? Math.ceil(p.seconds * src - 1e-9) : null;   // recorded frames per clip
+    const out = [];
+    for (let start = first; start <= last; start += span) {
+      const frames = [];
+      let real = 0;
+      for (let k = 0; ; k++) {
+        const offset = Math.round((k * src) / p.fps);
+        if (span !== null && offset > span - 1) break;
+        if (start + offset > last) {
+          if (span === null) break;
+          frames.push(frames[frames.length - 1]);          // hold the last frame
+        } else {
+          frames.push(timeline[nearestIndex(timeline, start + offset)]);
+          real++;
+        }
+      }
+      out.push({ start, frames, real });
+      if (span === null) break;
+    }
+    return out;
+  }
+
+  const cards = [];
+  const thumbQueue = [];
+  let thumbActive = 0;
+  function pumpThumbs() {
+    while (thumbActive < THUMB_PARALLEL && thumbQueue.length) {
+      const job = thumbQueue.shift();
+      thumbActive++;
+      job().finally(() => { thumbActive--; pumpThumbs(); });
+    }
+  }
+  const thumbH = Math.round((THUMB_W * imgH) / imgW);
+  function drawThumb(card) {     // the clip's first frame in the tile arrangement
+    const g = card.__canvas.getContext("2d");
+    const frame = card.__frame;
+    return Promise.all(data.tiles.map((view, t) => {
+      const x = (t % cols) * (THUMB_W + THUMB_GAP), y = Math.floor(t / cols) * (thumbH + THUMB_GAP);
+      g.fillStyle = tileBg;
+      g.fillRect(x, y, THUMB_W, thumbH);
+      if (view < 0 || missing[view].has(frame)) return null;
+      const u = `${data.base}/preview/${data.ds}/${view}/${frame}?w=${THUMB_W}`;
+      return load(u, "low").then((ok) => {
+        const entry = pool.get(u);
+        if (ok && entry && entry.state === "ok") g.drawImage(entry.img, x, y, THUMB_W, thumbH);
+      });
+    }));
+  }
+  const thumbObserver = new IntersectionObserver((entries) => {   // thumbnails load as they scroll into view
+    for (const e of entries) {
+      if (!e.isIntersecting || e.target.__queued) continue;
+      e.target.__queued = true;
+      thumbObserver.unobserve(e.target);
+      thumbQueue.push(() => drawThumb(e.target));
+    }
+    pumpThumbs();
+  }, { root: gallery, rootMargin: "300px" });
+
+  function buildGallery() {
+    thumbObserver.disconnect();
+    thumbQueue.length = 0;
+    gallery.replaceChildren();
+    cards.length = 0;
+    gallery.hidden = !p.auto;
+    if (!p.auto) return;
+    const n = p.splits.length;
+    el("div", "mvk-gallery-head", gallery).textContent = `${n} clip${n === 1 ? "" : "s"} in this arrangement ` +
+      "(first frame of each). Click a clip to show it; Play goes on through all of them.";
+    const grid = el("div", "mvk-gallery-grid", gallery);
+    const first = timeline[0];
+    const length = p.seconds ?? (last - first + 1) / src;
+    p.splits.forEach((sp, i) => {
+      const card = el("button", "mvk-card", grid);
+      card.type = "button";
+      const c = el("canvas", "mvk-card-thumb", card);
+      c.width = cols * THUMB_W + (cols - 1) * THUMB_GAP;
+      c.height = rows * thumbH + (rows - 1) * THUMB_GAP;
+      card.__canvas = c;
+      card.__frame = sp.frames[0];
+      const t0 = (sp.start - first) / src;
+      const held = sp.frames.length - sp.real;
+      const label = el("div", "mvk-card-label", card);
+      el("b", "", label).textContent = `Clip ${i + 1}`;
+      label.append(`  ·  ${formatSeconds(t0)}–${formatSeconds(t0 + length)} s`);
+      el("div", "mvk-card-sub", label).textContent = `frames ${sp.frames[0]}–${sp.frames[sp.frames.length - 1]}` +
+        (held ? `  ·  last ${held} held` : "");
+      card.addEventListener("click", () => selectClip(i));
+      cards.push(card);
+      thumbObserver.observe(card);
+    });
+    markCard(true);
+  }
+
+  function markCard(scroll) {   // highlight the clip on screen; keep it in view inside the gallery
+    cards.forEach((card, i) => card.classList.toggle("mvk-card-current", i === p.clip));
+    const card = cards[p.clip];
+    if (!scroll || !card || gallery.hidden) return;
+    const top = card.offsetTop, bottom = top + card.offsetHeight;
+    if (top < gallery.scrollTop) gallery.scrollTop = top - 8;
+    else if (bottom > gallery.scrollTop + gallery.clientHeight) gallery.scrollTop = bottom - gallery.clientHeight + 8;
+  }
+
+  function selectClip(i) {
+    pause();
+    p.clip = i;
+    p.ended = false;
+    markCard(false);
+    showStill(0);
+    updateStatus();
+  }
+
+  function resplit() {         // Auto Mode, FPS or Seconds changed: new clips, keep the picture
+    const f = p.shown ?? timeline[0];
+    p.splits = computeSplits();
+    let clip = 0;
+    while (clip < p.splits.length - 1 && p.splits[clip + 1].start <= f) clip++;
+    p.clip = clip;
+    const frames = p.splits[clip].frames;
+    let k = 0;
+    while (k < frames.length - 1 && frames[k + 1] <= f) k++;
+    p.ended = false;
+    buildGallery();
+    if (p.playing) { p.k = k + 1; p.pos = k; } else showStill(k);
+  }
+
+  function setAuto(on) {
+    if (on === p.auto) return;
+    pause();
+    p.auto = on;
+    autoToggle.setChecked(on);
+    p.ended = false;
+    if (on) { p.splits = computeSplits(); p.clip = 0; } else { p.anchor = p.origin; }
+    buildGallery();
+    showStill(0);                          // Auto Mode starts at the first frame, normal mode at the start frame
+    updateStatus();
+    if (p.setStateValue) p.setStateValue("auto", on);
+  }
+  autoToggle.addEventListener("click", () => setAuto(!p.auto));
 
   function ready(frame) {
     return urlsFor(frame).every((u) => u === null || ["ok", "error"].includes(loadState(u)));
@@ -307,7 +483,8 @@ function buildPlayer(root, data) {
     if (ti === undefined) return;
     const k = canvas.width / Math.max(1, canvas.getBoundingClientRect().width);   // canvas px per screen px
     const first = Math.max(0, ti - p.gt.trail);
-    const routeStart = Math.min(ti, tlIndex.get(p.origin) ?? 0);   // routes run from the start frame
+    const startFrame = p.auto ? p.splits[p.clip].frames[0] : p.origin;
+    const routeStart = Math.min(ti, tlIndex.get(startFrame) ?? 0);   // routes run from the (clip's) start frame
     data.tiles.forEach((view, t) => {
       const cams = view >= 0 && p.cams[view];
       if (!cams || !cams.length) return;
@@ -415,6 +592,29 @@ function buildPlayer(root, data) {
   };
 
   function updateStatus() {
+    const pick = p.fps === src ? "every recorded frame"
+      : src % p.fps === 0 ? `every ${ordinal(src / p.fps)} recorded frame`
+      : `${p.fps} of every ${src} recorded frames, evenly spaced`;
+    if (p.auto) {
+      const n = p.splits.length;
+      const sp = p.splits[p.clip];
+      const f = p.shown ?? sp.frames[0];
+      const position = Math.max(1, Math.min(sp.frames.length, p.pos + 1));
+      status.textContent = `clip ${p.clip + 1} of ${n}  ·  frame ${f}  ·  ${position} of ${sp.frames.length}` +
+        (position > sp.real ? "  ·  held" : "") + (p.ended ? "  ·  end" : "");
+      const first = timeline[0];
+      const lastClip = p.splits[n - 1];
+      const held = lastClip.frames.length - lastClip.real;
+      note.textContent = `Auto Mode: from frame ${first}  ·  recorded at ${src} fps  ·  ${p.fps} fps shows ${pick}`;
+      clipNote.textContent = p.seconds
+        ? `${n} clip${n === 1 ? "" : "s"} × ${formatSeconds(p.seconds)} s × ${p.fps} fps = ` +
+          `${p.splits[0].frames.length} frames each (recorded frames ${first} to ${last})` +
+          (held ? `; the last clip has ${lastClip.real} recorded frames and holds frame ` +
+                  `${lastClip.frames[lastClip.frames.length - 1]} for the other ${held}` : "")
+        : `1 clip: the whole recording, ${p.splits[0].frames.length} frames at ${p.fps} fps ` +
+          `(recorded frames ${first} to ${last}). Set Seconds to split it into clips.`;
+      return;
+    }
     const f = p.shown ?? p.origin;
     const seconds = ((f - p.origin) / src).toFixed(2);
     const plan = clipPlan();
@@ -428,9 +628,6 @@ function buildPlayer(root, data) {
         ? `Plays ${formatSeconds(p.seconds)} s × ${p.fps} fps = ${plan.total} frames (${range})`
         : `${formatSeconds(p.seconds)} s × ${p.fps} fps would be ${plan.requested} frames, but the recording ` +
           `ends at frame ${last}: plays ${plan.total} frames (${range}, ${length})`;
-    const pick = p.fps === src ? "every recorded frame"
-      : src % p.fps === 0 ? `every ${ordinal(src / p.fps)} recorded frame`
-      : `${p.fps} of every ${src} recorded frames, evenly spaced`;
     note.textContent = `Start: frame ${p.origin}  ·  recorded at ${src} fps  ·  ${p.fps} fps shows ${pick}`;
   }
 
@@ -438,7 +635,7 @@ function buildPlayer(root, data) {
     const upcoming = [];
     const horizon = Math.ceil(p.fps * WARM_SECONDS);
     for (let j = 0; j < Math.min(128, horizon); j++) {
-      const f = target(p.k + j);
+      const f = peek(j);
       if (f === null) break;
       upcoming.push(f);
     }
@@ -458,6 +655,7 @@ function buildPlayer(root, data) {
     const frame = target(k);
     if (frame === null) return;
     p.k = k + 1;
+    p.pos = k;
     const token = ++p.stillToken;
     request(frame).then(() => { if (token === p.stillToken && !p.playing) draw(frame); });
     prefetch();
@@ -468,12 +666,18 @@ function buildPlayer(root, data) {
     if (!root.isConnected) { pause(); return; }
     p.raf = requestAnimationFrame(tick);
     if (now < p.nextDue) return;
-    const frame = target(p.k);
+    let frame = target(p.k);
+    if (frame === null && p.auto && p.clip < p.splits.length - 1) {   // Auto Mode: on to the next clip
+      p.clip++;
+      p.k = 0;
+      markCard(true);
+      frame = target(0);
+    }
     if (frame === null) { finish(); return; }
     if (p.preroll) {          // just pressed Play: start once the next frames are loaded
       const upcoming = [];
       const count = Math.max(4, Math.ceil(p.fps * PREROLL_SECONDS));
-      for (let j = 0; j < count; j++) { const f = target(p.k + j); if (f !== null) upcoming.push(f); }
+      for (let j = 0; j < count; j++) { const f = peek(j); if (f !== null) upcoming.push(f); }
       if (!upcoming.every(ready) && now - p.preroll < PREROLL_MAX_MS) {
         upcoming.forEach(request);
         status.classList.add("mvk-loading");
@@ -484,6 +688,7 @@ function buildPlayer(root, data) {
       p.nextDue = now;
     }
     if (!ready(frame)) { p.stats.waits++; request(frame); return; }   // wait for the images, never skip a frame
+    p.pos = p.k;
     draw(frame);
     p.k++;
     const interval = 1000 / p.fps;
@@ -497,8 +702,14 @@ function buildPlayer(root, data) {
   }
 
   function start() {
-    const restart = p.ended || target(p.k) === null;   // at the end: play again from the start frame
-    if (restart) { p.anchor = p.origin; p.k = 0; p.ended = false; }
+    let restart;
+    if (p.auto) {                                      // at the end of the last clip: again from clip 1
+      if (p.ended) { p.clip = 0; p.k = 0; p.ended = false; markCard(true); }
+      restart = p.k === 0;
+    } else {
+      restart = p.ended || target(p.k) === null;       // at the end: play again from the start frame
+      if (restart) { p.anchor = p.origin; p.k = 0; p.ended = false; }
+    }
     p.stillToken++;
     p.playing = true;
     p.preroll = performance.now();
@@ -521,10 +732,10 @@ function buildPlayer(root, data) {
     updateStatus();
   }
 
-  function stop() {         // double-click: back to the start frame, paused
+  function stop() {         // double-click: back to the start frame (Auto Mode: clip 1), paused
     pause();
     p.ended = false;
-    p.anchor = p.origin;
+    if (p.auto) { p.clip = 0; markCard(true); } else p.anchor = p.origin;
     showStill(0);
     updateStatus();
   }
@@ -536,6 +747,7 @@ function buildPlayer(root, data) {
     p.anchor = p.shown ?? p.origin;   // keep the current picture; new spacing from here on
     p.k = 1;
     p.fps = fps;
+    if (p.auto) resplit();
     p.nextDue = performance.now() + 1000 / fps;
     savedFps.set(data.root, fps);
     storageSet(`mvk:fps:${data.root}`, String(fps));
@@ -556,6 +768,7 @@ function buildPlayer(root, data) {
     secondsInput.value = seconds === null ? "" : String(seconds);
     if (seconds === p.seconds) return;
     p.seconds = seconds;
+    if (p.auto) resplit();
     savedSeconds.set(data.root, seconds);
     storageSet(`mvk:seconds:${data.root}`, seconds === null ? "" : String(seconds));
     clearTimeout(p.secondsTimer);
@@ -601,7 +814,7 @@ function buildPlayer(root, data) {
   if (panel) p.observer.observe(panel);
   p.observer.observe(root);
 
-  p.destroy = () => { pause(); p.observer.disconnect(); };
+  p.destroy = () => { pause(); p.observer.disconnect(); thumbObserver.disconnect(); };
   fpsInput.value = String(p.fps);
   secondsInput.value = p.seconds === null ? "" : String(p.seconds);
   setIcon();
@@ -635,6 +848,7 @@ export default function (component) {
   // the player's values, so that Convert converts the clip set up here.
   if (reported && reported.fps !== p.fps) setStateValue("fps", p.fps);
   if (reported && (reported.seconds ?? null) !== p.seconds) setStateValue("seconds", p.seconds);
+  if (reported && Boolean(reported.auto) !== p.auto) setStateValue("auto", p.auto);
   const gtConfig = JSON.stringify(gt || null);
   if (root.__gt !== gtConfig) {
     root.__gt = gtConfig;

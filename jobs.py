@@ -23,7 +23,7 @@ _processes: dict[str, subprocess.Popen] = {}
 
 
 def start(dataset_root: str, start_frame: int, fps: int, seconds: float | None, scene_file: str,
-          clip: dict, views: list[str] | None = None, output: str = "") -> dict:
+          clip: dict, views: list[str] | None = None, output: str = "", auto: bool = False) -> dict:
     """Launch a conversion; returns the job record the app keeps in its session state."""
     JOBS_DIR.mkdir(parents=True, exist_ok=True)
     job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{len(_processes)}"
@@ -39,11 +39,13 @@ def start(dataset_root: str, start_frame: int, fps: int, seconds: float | None, 
         cmd += ["--view", view]
     if output:
         cmd += ["--output", output]
+    if auto:                                   # Auto Mode: every clip of the recording, one scene each
+        cmd += ["--auto"]
     with open(log, "w") as log_file:
         _processes[job_id] = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT,
                                               cwd=str(CONVERTER.parent))
     return {"id": job_id, "progress": str(progress), "log": str(log), "dataset": dataset_root,
-            "clip": clip, "started": time.time()}
+            "clip": clip, "auto": auto, "started": time.time()}
 
 
 def read(job: dict) -> dict:
@@ -80,8 +82,16 @@ def stop(job: dict) -> None:
     for step in state.get("steps", []):
         if step["status"] == "running":
             step["status"] = "stopped"
-    state.update(status="stopped", finished=time.time(),
-                 error="Stopped." + (" The incomplete scene folder was removed." if removed else ""))
+    batch = state.get("batch")
+    for scene in (batch or {}).get("scenes", []):
+        if scene["status"] == "running":
+            scene["status"] = "stopped"
+    if batch:
+        message = (f"Stopped after {batch.get('done', 0)} of {batch['total']} scenes; the finished ones stay in "
+                   f"{batch['root']}." + (" The unfinished scene was removed." if removed else ""))
+    else:
+        message = "Stopped." + (" The incomplete scene folder was removed." if removed else "")
+    state.update(status="stopped", finished=time.time(), error=message)
     Path(job["progress"]).write_text(json.dumps(state))
 
 

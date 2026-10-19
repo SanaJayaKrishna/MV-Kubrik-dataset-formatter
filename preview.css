@@ -39,3 +39,45 @@
 .mvk-chip { display: inline-flex; align-items: center; gap: 0.35rem; }
 .mvk-dot { width: 0.7rem; height: 0.7rem; border-radius: 50%; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35); }
 .mvk-player-clip { margin-top: 0.15rem; color: var(--st-text-color, #31333f); }
+
+/* Control row: Auto Mode | play | FPS | Seconds | status, with a divider between the groups. */
+.mvk-player-bar { gap: 0.4rem 0; }
+.mvk-player-bar > .mvk-group { display: inline-flex; align-items: center; padding: 0 0.9rem; }
+.mvk-player-bar > .mvk-group + .mvk-group { border-left: 1px solid var(--st-border-color, rgba(49, 51, 63, 0.2)); }
+.mvk-player-bar .mvk-toggle { white-space: nowrap; }
+
+/* Auto Mode gallery: one card per clip (its first frame in the tile arrangement). */
+.mvk-gallery {
+  position: relative;               /* the cards' offsetTop is measured from here */
+  max-height: 24rem;
+  overflow: auto;
+  margin-top: 0.7rem;
+  padding: 0.5rem;
+  border: 1px solid var(--st-border-color, rgba(49, 51, 63, 0.2));
+  border-radius: var(--st-base-radius, 0.5rem);
+}
+.mvk-gallery[hidden] { display: none; }
+.mvk-gallery-head {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+  color: var(--st-gray-text-color, #808495);
+}
+.mvk-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.5rem; }
+.mvk-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.35rem;
+  border: 2px solid transparent;
+  border-radius: var(--st-base-radius, 0.5rem);
+  background: var(--st-secondary-background-color, #f0f2f6);
+  color: var(--st-text-color, #31333f);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.mvk-card:hover { border-color: var(--st-border-color, rgba(49, 51, 63, 0.4)); }
+.mvk-card-current, .mvk-card-current:hover { border-color: var(--st-primary-color, #ff4b4b); }
+.mvk-card-thumb { display: block; width: 100%; height: auto; border-radius: 0.3rem; }
+.mvk-card-label { font-size: 0.78rem; line-height: 1.3; font-variant-numeric: tabular-nums; }
+.mvk-card-sub { color: var(--st-gray-text-color, #808495); }

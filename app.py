@@ -344,11 +344,12 @@ def preview_body(ds: pv.Dataset, request: dict, full: pv.Dataset) -> None:
         return
     overlay = ground_truth_controls(ds)
     state = st.session_state.get("player") or {}       # app.py's copy of the player's FPS / Seconds
-    reported = {"fps": state.get("fps", SOURCE_FPS), "seconds": state.get("seconds")}
+    reported = {"fps": state.get("fps", SOURCE_FPS), "seconds": state.get("seconds"), "auto": bool(state.get("auto"))}
     player = player_component(read("common.js", "preview.js"), read("viewer.css", "preview.css"))
     result = player(key="player", data={**preview_data(ds, request), "gt": overlay, "reported": reported},
-                    default={"fps": SOURCE_FPS, "seconds": None},
-                    on_fps_change=lambda: None, on_seconds_change=lambda: None, on_close_change=lambda: None)
+                    default={"fps": SOURCE_FPS, "seconds": None, "auto": False},
+                    on_fps_change=lambda: None, on_seconds_change=lambda: None, on_auto_change=lambda: None,
+                    on_close_change=lambda: None)
     # The player reports FPS and clip length (st.session_state.player["fps"] / ["seconds"], None =
     # until the last frame) for later phases.
     if getattr(result, "close", None):   # Preview toggle switched off: back to the viewer
@@ -398,10 +399,13 @@ def output_controls(ds: pv.Dataset) -> str:
 
 def convert_controls(ds: pv.Dataset, request: dict, result) -> None:
     """Save-to folder and Convert button: the clip shown in the preview (start frame, FPS, Seconds) of
-    the previewed cameras (ds) becomes one scene."""
+    the previewed cameras (ds) becomes one scene. In Auto Mode: Auto Convert, every clip one scene."""
     ss = st.session_state
     fps = int(getattr(result, "fps", None) or SOURCE_FPS)
     seconds = getattr(result, "seconds", None)
+    if getattr(result, "auto", None):
+        auto_convert_controls(ds, fps, seconds)
+        return
     start = nearest_frame(ds.timeline, request["frame"])          # as the player: the nearest frame all cameras have
     frames = cv.clip_frames(ds.timeline, start, fps, seconds)
     views = list(ds.views)                                        # the previewed cameras, dataset order
@@ -427,6 +431,45 @@ def convert_controls(ds: pv.Dataset, request: dict, result) -> None:
                 "views": len(views), "target": target}
         ss.convert_job = jobs.start(ds.root, start, fps, seconds, clean_path(ss[scene_key(ds)]), clip,
                                     views=views, output=output)
+        st.rerun()                     # the conversion pane lives outside this fragment
+
+
+def auto_convert_controls(ds: pv.Dataset, fps: int, seconds: float | None) -> None:
+    """Auto Mode: Save-to folder and Auto Convert: every clip of the recording (from its first frame,
+    Seconds each at FPS) becomes its own scene in <Save to>/AutoConverted/_<date-time>/1 ... X."""
+    ss = st.session_state
+    splits = cv.auto_splits(ds.timeline, fps, seconds)
+    per_clip = len(splits[0]["frames"])
+    held = len(splits[-1]["frames"]) - splits[-1]["real"]
+    views = list(ds.views)
+    output = output_controls(ds)
+    problem = output_problem(output)
+    busy = jobs.is_running(ss.get("convert_job"))
+    target = f"{output.rstrip('/')}/{cv.AUTO_DIR}"
+    with st.container(horizontal=True, horizontal_alignment="center"):
+        clicked = st.button("Converting..." if busy else "Auto Convert", icon=":material/auto_mode:", key="auto_convert",
+                            disabled=busy or per_clip < 2 or problem is not None,
+                            help="Convert every clip shown in the gallery into its own MV-Kubric scene. The conversion "
+                                 "runs in the background; a pane shows its progress scene by scene.")
+    n = len(splits)
+    if problem:
+        st.error(problem)
+    elif per_clip < 2:
+        st.warning("Each clip needs at least 2 frames: give more seconds or a higher FPS.")
+    else:
+        length = (f"{n} clip{'s' if n != 1 else ''} of {seconds:g} s × {fps} fps = {per_clip} frames each" if seconds
+                  else f"1 clip: the whole recording, {per_clip} frames at {fps} fps")
+        st.caption(f"Auto Convert: {length} (recorded frames {ds.timeline[0]} to {ds.timeline[-1]}) from {len(views)} "
+                   f"camera{'s' if len(views) != 1 else ''} ({', '.join(views)}), one scene per clip, into "
+                   f"{target}/_<date and time of the conversion>/1 … {n}"
+                   + (f"  \nThe last clip has {splits[-1]['real']} recorded frames and holds its last frame for the "
+                      f"other {held}." if held else "")
+                   + ("" if os.path.isdir(output) else f"  \n{output} does not exist yet and will be created."))
+    if clicked and not busy and problem is None and per_clip >= 2:
+        clip = {"auto": True, "clips": n, "frames": per_clip, "fps": fps, "seconds": seconds, "views": len(views),
+                "target": target, "first": ds.timeline[0], "last": ds.timeline[-1]}
+        ss.convert_job = jobs.start(ds.root, ds.timeline[0], fps, seconds, clean_path(ss[scene_key(ds)]), clip,
+                                    views=views, output=output, auto=True)
         st.rerun()                     # the conversion pane lives outside this fragment
 
 
@@ -471,7 +514,7 @@ def conversion_body(job: dict, was_running: bool) -> None:
     if was_running and not running:
         st.rerun()                     # finished: stop polling and enable Convert again
     head = st.container(horizontal=True, vertical_alignment="center", horizontal_alignment="distribute")
-    head.markdown("##### MV-Kubric conversion")
+    head.markdown("##### MV-Kubric auto conversion" if job.get("auto") else "##### MV-Kubric conversion")
     if running:
         if head.button("Stop", icon=":material/stop:", key="convert_stop", type="tertiary"):
             jobs.stop(job)
@@ -479,6 +522,9 @@ def conversion_body(job: dict, was_running: bool) -> None:
     elif head.button("Close", icon=":material/close:", key="convert_close", type="tertiary"):
         ss.convert_job = None
         st.rerun()
+    if job.get("auto"):
+        auto_conversion_body(job, state)
+        return
     clip = job["clip"]
     st.caption(f"Frames {clip['first']} to {clip['last']}: {clip['frames']} frames at {clip['fps']} fps from "
                f"{clip['views']} views  \nOutput: {state.get('output') or clip['target']}")
@@ -512,6 +558,80 @@ def conversion_body(job: dict, was_running: bool) -> None:
                 st.code(state["traceback"], language=None)
 
 
+
+
+def clock(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}" if seconds >= 3600 else \
+        f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def auto_conversion_body(job: dict, state: dict) -> None:
+    """Progress of an Auto Mode batch: overall bar (scenes done + the current scene's steps), the
+    current scene's steps, and the scenes done, failed and still to do."""
+    clip = job["clip"]
+    batch = state.get("batch") or {}
+    scenes = batch.get("scenes", [])
+    total = batch.get("total") or clip["clips"]
+    status = state.get("status")
+    st.caption(f"{clip['clips']} clip{'s' if clip['clips'] != 1 else ''} × {clip['frames']} frames at {clip['fps']} fps "
+               f"(recorded frames {clip['first']} to {clip['last']}) from {clip['views']} views  \n"
+               f"Output: {batch.get('root') or clip['target'] + '/_<date-time>'}")
+    finished = [sc for sc in scenes if sc["status"] in ("done", "failed")]
+    current = next((sc for sc in scenes if sc["status"] == "running"), None)
+    fraction = 1.0 if status == "done" else min(1.0, (len(finished) + (overall_progress(state) if current else 0)) / max(1, total))
+    elapsed = (state.get("finished") or time.time()) - state.get("started", job["started"])
+    left = f"  ·  about {clock(elapsed / fraction * (1 - fraction))} left" if status == "running" and fraction > 0.01 else ""
+    label = {"starting": "Starting", "done": "Done", "failed": "Failed", "stopped": "Stopped"}.get(
+        status, f"Scene {current['number']} of {total}" if current else "Converting")
+    st.progress(fraction, text=f"{label}: {fraction * 100:.0f} %  ·  {clock(elapsed)}{left}")
+
+    if current:
+        held = f", the last {current['held']} held" if current["held"] else ""
+        st.markdown(f"**Now: scene {current['number']}** (recorded frames {current['first']} to {current['last']}, "
+                    f"{current['frames']} frames{held})")
+        st.markdown("\n".join(f"- {step_line(s)}" for s in state.get("steps", []) if s["key"] != "folder"))
+
+    done = [sc for sc in scenes if sc["status"] == "done"]
+    failed = [sc for sc in scenes if sc["status"] in ("failed", "stopped")]
+    pending = [sc for sc in scenes if sc["status"] == "pending"]
+    st.markdown(f"**Completed** ({len(done)} of {total})")
+    if done:
+        with st.expander(f"Scenes {cv.frame_ranges([sc['number'] for sc in done])}", expanded=False):
+            lines = []
+            for sc in done:
+                took = f"  ·  {clock(sc['finished'] - sc['started'])}" if sc.get("started") and sc.get("finished") else ""
+                held = f"  ·  last {sc['held']} held" if sc["held"] else ""
+                objects = f"  ·  objects: {', '.join(sc.get('objects') or []) or 'none'}"
+                notes = "".join(f"  \n:orange[{note}]" for note in sc.get("notes", []))
+                lines.append(f"- {STATUS_ICONS['done']} Scene {sc['number']}  ·  frames {sc['first']} to {sc['last']}"
+                             f"{held}{took}{objects}{notes}")
+            st.markdown("\n".join(lines))
+    else:
+        st.markdown(":gray[Nothing yet]")
+    if failed:
+        st.markdown(f"**Not converted** ({len(failed)})")
+        st.markdown("\n".join(f"- {STATUS_ICONS.get(sc['status'], '')} Scene {sc['number']}  ·  frames {sc['first']} "
+                              f"to {sc['last']}" + (f"  \n:red[{sc['error']}]" if sc.get("error") else "")
+                              for sc in failed))
+    st.markdown(f"**Pending** ({len(pending)})")
+    st.markdown(f":gray[Scenes {cv.frame_ranges([sc['number'] for sc in pending])}]" if pending
+                else ":gray[Nothing left]")
+    for note in state.get("notes", []):
+        st.caption(f":orange[{note}]")
+    if state.get("not_written"):
+        st.caption("Not written in any scene, because MVTracker makes them itself: " + "; ".join(
+            f"{item['name']} ({item['reason']})" for item in state["not_written"]) + ".")
+    summary = state.get("summary")
+    if status == "done" and summary:
+        extra = f" {summary['failed']} clip(s) could not be converted (see above)." if summary.get("failed") else ""
+        st.success(f"{summary['scenes']} of {summary['total']} scenes saved to {summary['root']}: {summary['frames']} "
+                   f"frames each at {summary['fps']} fps from {summary['views']} views.{extra}")
+    elif status in ("failed", "stopped"):
+        st.error(state.get("error") or "The conversion did not finish.")
+        if state.get("traceback"):
+            with st.expander("Details"):
+                st.code(state["traceback"], language=None)
 
 
 def scene_key(ds: pv.Dataset) -> str:
@@ -574,6 +694,12 @@ def controls_help() -> None:
         f"default {cv.DEFAULT_OUTPUT}. Type another path or click Browse to save elsewhere (a folder "
         "that does not exist is created, except the default one). A pane shows the progress; it runs in the "
         "background, so the app stays usable.\n"
+        "- **Auto Mode:** the switch at the left of the play button. On: the whole recording, from its first "
+        "frame, is split into clips of Seconds each (one clip of everything when Seconds is empty), each shown "
+        "at FPS (30 when empty); a short last clip holds its last frame to full length. A gallery under the "
+        "player shows every clip in the arrangement: click one to show it, Play goes through them all. "
+        "Auto Convert then saves one scene per clip in the Save to folder's AutoConverted/_<date-time>/ "
+        "(1, 2, 3, ...). Off: everything as before.\n"
         "- **Ground truth:** in the preview, choose objects in Ground truth values (clear it to "
         "hide the overlay). Each object gets 48 tracked points on its real surface, taken from the "
         "recorded depth, moved with its exact pose from the Scene file above and drawn in every view "
