@@ -4,7 +4,7 @@ The output follows the generator that made MV-Kubric (ethz-vlg/kubric, branch
 multiview-point-tracking, challenges/point_tracking_3d/worker.py) and the loader that reads it
 (ethz-vlg/mvtracker, mvtracker/datasets/kubric_multiview_dataset.py). One scene per run:
 
-    <output folder>/<n>/             (output folder: --output, default <dataset>/mv_kubric)
+    <output folder>/<n>/             (output folder: --output, default DEFAULT_OUTPUT)
         cameras.npz                  camera_positions (V, 3), lookat_positions (V, 3)
         tracked_objects.json         {"names": [...], "ids": [...]}; "dome" = the static background
         tracks_3d.npz                tracks_3d (T, N, 3): world positions of N surface points
@@ -62,7 +62,7 @@ import previews as pv  # noqa: E402
 
 SOURCE_MTIME = os.path.getmtime(__file__)   # app.py compares it with the file: changed code needs a restart
 
-OUTPUT_DIR = "mv_kubric"       # default output folder, inside the dataset folder
+DEFAULT_OUTPUT = "/home/jk/mnt_dataset_mig1/mvkds"   # default folder for the scenes, on the mig1 share
 UNFINISHED = ".unfinished"     # marker inside a scene folder while it is being written
 N_POINTS = 18000               # tracked points per scene, as in MV-Kubric
 BACKGROUND_SHARE = 0.75        # MV-Kubric puts 59-89 % (mean 75 %) of its points on the background
@@ -389,8 +389,13 @@ def video_writer(path: Path, fps: int):
 
 # --------------------------------------------------------------------------- output folder
 
-def default_output(dataset_root: str) -> str:
-    return os.path.join(dataset_root, OUTPUT_DIR)
+def default_output_problem(folder: str) -> str | None:
+    """The default folder is never created: if it is missing, the share it lives on is probably not
+    mounted, and the scenes would land on the local disk under the empty mount point."""
+    if os.path.abspath(folder) == DEFAULT_OUTPUT and not os.path.isdir(DEFAULT_OUTPUT):
+        return (f"The default output folder {DEFAULT_OUTPUT} does not exist. Is the share mounted at "
+                f"{os.path.dirname(DEFAULT_OUTPUT)}? Mount it, or choose another folder.")
+    return None
 
 
 def make_output_root(out: Path, progress: Progress) -> Path:
@@ -943,7 +948,10 @@ def convert(args, progress: Progress) -> None:
         raise ValueError(f"Cameras not in this dataset: {', '.join(unknown)}.")
     ds = pv.subset(ds, args.view or ds.views)          # the chosen cameras and the frames they all have
 
-    out_root = Path(os.path.abspath(os.path.expanduser(args.output or default_output(root))))
+    out_root = Path(os.path.abspath(os.path.expanduser(args.output or DEFAULT_OUTPUT)))
+    problem = default_output_problem(str(out_root))
+    if problem:
+        raise FileNotFoundError(problem)
     progress.start("folder", str(out_root))
     make_output_root(out_root, progress)
     out = new_scene_folder(out_root, progress)
@@ -1039,7 +1047,7 @@ def main() -> None:
     ap.add_argument("--seconds", type=float, default=None)
     ap.add_argument("--scene-file", default="")
     ap.add_argument("--view", action="append", default=None, help="camera (view folder) to convert; repeatable")
-    ap.add_argument("--output", default="", help="folder that receives the scene folder (default <dataset>/mv_kubric)")
+    ap.add_argument("--output", default="", help=f"folder that receives the scene folder (default {DEFAULT_OUTPUT})")
     ap.add_argument("--progress", required=True)
     ap.add_argument("--parent-pid", type=int, default=None)
     args = ap.parse_args()

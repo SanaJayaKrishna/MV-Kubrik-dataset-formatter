@@ -372,14 +372,14 @@ def output_problem(folder: str) -> str | None:
         return "Give the full path of the output folder (starting with /)."
     if os.path.exists(folder) and not os.path.isdir(folder):
         return f"{folder} is a file, not a folder."
-    return None
+    return cv.default_output_problem(folder)
 
 
 def output_controls(ds: pv.Dataset) -> str:
     """'Save to' field above Convert: the folder that receives the scene folders (1, 2, 3, ...).
-    Starts at the app's default, <dataset>/mv_kubric, and is remembered per dataset folder."""
+    Starts at the app's default (converter.DEFAULT_OUTPUT) and is remembered per dataset folder."""
     ss = st.session_state
-    default = cv.default_output(ds.root)
+    default = cv.DEFAULT_OUTPUT
     key = remembered(output_key(ds), default)
     row = st.container(horizontal=True, vertical_alignment="bottom", key="mvk_output_row")
     row.text_input("Save to", key=key, placeholder=default,
@@ -571,8 +571,8 @@ def controls_help() -> None:
         "play to the end. The total number of frames is shown under the player.\n"
         "- **Convert:** in the preview, Convert turns the clip shown (start frame, FPS, Seconds) into one "
         "MV-Kubric scene: a numbered folder (1, 2, 3, ...) in the Save to folder above the button, by "
-        f"default the dataset folder's {cv.OUTPUT_DIR}/. Type another path or click Browse to save "
-        "elsewhere (a folder that does not exist is created). A pane shows the progress; it runs in the "
+        f"default {cv.DEFAULT_OUTPUT}. Type another path or click Browse to save elsewhere (a folder "
+        "that does not exist is created, except the default one). A pane shows the progress; it runs in the "
         "background, so the app stays usable.\n"
         "- **Ground truth:** in the preview, choose objects in Ground truth values (clear it to "
         "hide the overlay). Each object gets 48 tracked points on its real surface, taken from the "
